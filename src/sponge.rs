@@ -11,6 +11,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+use std::process::exit;
 
 const USAGE: &str = "sponge [-a] <file>: soak up all input from stdin and write it to <file>";
 
@@ -19,23 +20,37 @@ enum Output {
     File(String),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn print_help_and_exit() -> ! {
+    eprintln!("{}", USAGE);
+    exit(1);
+}
+
+/// Parse arguments, run job, pass return code
+fn main() -> ! {
     let mut args = std::env::args();
     args.next(); // bin name
 
     let (append, output) = match args.next() {
         Some(s) if &s == "-a" => match args.next() {
             Some(filename) => (true, Output::File(filename)),
-            None => panic!(USAGE),
+            None => print_help_and_exit(),
         },
         Some(filename) => (false, Output::File(filename)),
         None => (false, Output::StdOut),
     };
 
     if args.next().is_some() {
-        panic!(USAGE);
+        print_help_and_exit();
     }
 
+    match sponge(output, append) {
+        Ok(_) => exit(0),
+        Err(_) => exit(1),
+    }
+}
+
+/// `sponge` implementation
+fn sponge(output: Output, append: bool) -> io::Result<()> {
     let mut write: Box<dyn Write> = match output {
         Output::StdOut => Box::new(io::stdout()),
         Output::File(filename) => {
