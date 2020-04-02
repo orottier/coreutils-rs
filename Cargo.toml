@@ -13,3 +13,7 @@ lto = true
 [[bin]]
 path = "src/sponge.rs"
 name = "sponge"
+
+[[bin]]
+path = "src/tee.rs"
+name = "tee"
