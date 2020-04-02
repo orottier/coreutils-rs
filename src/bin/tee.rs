@@ -10,13 +10,10 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::process::exit;
 
+use coreutils::print_help_and_exit;
+
 const USAGE: &str =
     "tee [OPTION]... [FILE]...\nread from standard input and write to standard output and files";
-
-fn print_help_and_exit() -> ! {
-    eprintln!("{}", USAGE);
-    exit(1);
-}
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
@@ -27,7 +24,7 @@ fn main() -> ! {
 
     let append = match args.next() {
         Some(s) if &s == "-a" => true,
-        Some(s) if s.starts_with('-') => print_help_and_exit(),
+        Some(s) if s.starts_with('-') => print_help_and_exit(USAGE),
         Some(filename) => (filenames.push(filename), false).1,
         None => false,
     };

@@ -13,16 +13,13 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::process::exit;
 
+use coreutils::print_help_and_exit;
+
 const USAGE: &str = "sponge [-a] <file>: soak up all input from stdin and write it to <file>";
 
 enum Output {
     StdOut,
     File(String),
-}
-
-fn print_help_and_exit() -> ! {
-    eprintln!("{}", USAGE);
-    exit(1);
 }
 
 /// Parse arguments, run job, pass return code
@@ -33,14 +30,14 @@ fn main() -> ! {
     let (append, output) = match args.next() {
         Some(s) if &s == "-a" => match args.next() {
             Some(filename) => (true, Output::File(filename)),
-            None => print_help_and_exit(),
+            None => print_help_and_exit(USAGE),
         },
         Some(filename) => (false, Output::File(filename)),
         None => (false, Output::StdOut),
     };
 
     if args.next().is_some() {
-        print_help_and_exit();
+        print_help_and_exit(USAGE);
     }
 
     match sponge(output, append) {
