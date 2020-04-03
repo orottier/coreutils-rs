@@ -9,64 +9,48 @@
 //!  - then, update the output file atomically
 //!  - preserve the permissions of the output file if it already exists
 
-use std::fs::OpenOptions;
+use std::convert::TryFrom;
 use std::io::{self, Read, Write};
 use std::process::exit;
 
-use coreutils::print_help_and_exit;
+use coreutils::{print_help_and_exit, Output, OutputArg};
 
 const USAGE: &str = "sponge [-a] <file>: soak up all input from stdin and write it to <file>";
-
-enum Output {
-    StdOut,
-    File(String),
-}
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
     let mut args = std::env::args();
     args.next(); // bin name
 
-    let (append, output) = match args.next() {
+    let output_arg = match args.next() {
         Some(s) if &s == "-a" => match args.next() {
-            Some(filename) => (true, Output::File(filename)),
+            Some(filename) => OutputArg::File(filename, true),
             None => print_help_and_exit(USAGE),
         },
-        Some(filename) => (false, Output::File(filename)),
-        None => (false, Output::StdOut),
+        Some(filename) => OutputArg::File(filename, false),
+        None => OutputArg::Stdout,
     };
 
     if args.next().is_some() {
         print_help_and_exit(USAGE);
     }
 
-    match sponge(output, append) {
+    match sponge(output_arg) {
         Ok(_) => exit(0),
         Err(_) => exit(1),
     }
 }
 
 /// `sponge` implementation
-fn sponge(output: Output, append: bool) -> io::Result<()> {
-    let mut write: Box<dyn Write> = match output {
-        Output::StdOut => Box::new(io::stdout()),
-        Output::File(filename) => {
-            let file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(append)
-                .truncate(!append)
-                .open(filename)?;
-            Box::new(file)
-        }
-    };
+fn sponge(output_arg: OutputArg) -> io::Result<()> {
+    let mut output = Output::try_from(&output_arg)?;
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut buffer = vec![];
     input.read_to_end(&mut buffer)?;
 
-    write.write_all(&buffer)?;
+    output.write_all(&buffer)?;
 
     Ok(())
 }
