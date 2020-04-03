@@ -6,7 +6,7 @@
 //!  - support options
 
 use std::convert::TryFrom;
-use std::io;
+use std::io::{self, BufRead, Write};
 use std::process::exit;
 
 use coreutils::{print_help_and_exit, Input, InputArg};
@@ -19,25 +19,34 @@ fn main() -> ! {
     args.next(); // bin name
 
     let mut has_stdin = false; // only take stdin once
+    let mut line_numbers = false;
 
-    let inputs: Vec<_> = args
+    let mut inputs: Vec<_> = args
         .flat_map(|s| match s.as_ref() {
             "-" if has_stdin => None,
             "-" => {
                 has_stdin = true;
                 Some(InputArg::Stdin)
             }
+            "-n" => {
+                line_numbers = true;
+                None
+            }
             s if s.starts_with('-') => print_help_and_exit(USAGE),
             _ => Some(InputArg::File(s)),
         })
         .collect();
 
-    cat(&inputs);
+    if inputs.is_empty() {
+        inputs.push(InputArg::Stdin);
+    }
+
+    cat(&inputs, line_numbers);
     exit(0)
 }
 
 /// `cat` implementation
-fn cat(input_args: &[InputArg]) {
+fn cat(input_args: &[InputArg], line_numbers: bool) {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
@@ -51,7 +60,19 @@ fn cat(input_args: &[InputArg]) {
                 .ok()
         })
         .for_each(|input| {
-            let result = io::copy(&mut input.as_bufread(), &mut stdout);
+            let result = if line_numbers {
+                let mut n = 0u32;
+                input
+                    .as_bufread()
+                    .lines()
+                    .flat_map(|line| line.ok())
+                    .try_for_each(|line| {
+                        n += 1;
+                        stdout.write_fmt(format_args!("{:>6} {}\n", n, line))
+                    })
+            } else {
+                io::copy(&mut input.as_bufread(), &mut stdout).map(|_| ())
+            };
 
             if result.is_err() {
                 eprintln!("...");
