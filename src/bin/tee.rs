@@ -38,7 +38,7 @@ fn main() -> ! {
 }
 
 /// `tee` implementation
-fn tee(output_args: &[OutputArg]) -> io::Result<()> {
+fn tee(output_args: &[OutputArg<String>]) -> io::Result<()> {
     let mut outputs = output_args
         .iter()
         .map(Output::try_from)

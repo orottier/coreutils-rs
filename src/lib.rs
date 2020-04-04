@@ -2,6 +2,7 @@ use std::convert::TryFrom;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::exit;
 
 pub fn print_help_and_exit(usage: &str) -> ! {
@@ -9,11 +10,11 @@ pub fn print_help_and_exit(usage: &str) -> ! {
     exit(1);
 }
 
-pub enum InputArg {
+pub enum InputArg<S: AsRef<Path>> {
     /// Standard input
     Stdin,
     /// File(filename)
-    File(String),
+    File(S),
 }
 
 pub enum Input {
@@ -21,10 +22,10 @@ pub enum Input {
     File(File),
 }
 
-impl TryFrom<&InputArg> for Input {
+impl<S: AsRef<Path>> TryFrom<&InputArg<S>> for Input {
     type Error = io::Error;
 
-    fn try_from(value: &InputArg) -> Result<Self, Self::Error> {
+    fn try_from(value: &InputArg<S>) -> Result<Self, Self::Error> {
         match value {
             InputArg::Stdin => Ok(Self::Stdin(io::stdin())),
             InputArg::File(filename) => File::open(filename).map(Self::File),
@@ -41,11 +42,11 @@ impl Input {
     }
 }
 
-pub enum OutputArg {
+pub enum OutputArg<S: AsRef<Path>> {
     /// Standard output
     Stdout,
     /// File(filename, append)
-    File(String, bool),
+    File(S, bool),
 }
 
 pub enum Output {
@@ -53,10 +54,10 @@ pub enum Output {
     File(File),
 }
 
-impl TryFrom<&OutputArg> for Output {
+impl<S: AsRef<Path>> TryFrom<&OutputArg<S>> for Output {
     type Error = io::Error;
 
-    fn try_from(value: &OutputArg) -> Result<Self, Self::Error> {
+    fn try_from(value: &OutputArg<S>) -> Result<Self, Self::Error> {
         match value {
             OutputArg::Stdout => Ok(Self::Stdout(io::stdout())),
             OutputArg::File(filename, append) => OpenOptions::new()

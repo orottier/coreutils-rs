@@ -42,7 +42,7 @@ fn main() -> ! {
 }
 
 /// `sponge` implementation
-fn sponge(output_arg: OutputArg) -> io::Result<()> {
+fn sponge(output_arg: OutputArg<String>) -> io::Result<()> {
     let mut output = Output::try_from(&output_arg)?;
 
     let stdin = io::stdin();

@@ -43,7 +43,7 @@ fn main() -> ! {
 }
 
 /// `pv` implementation
-fn pv(input_arg: &InputArg) -> io::Result<()> {
+fn pv(input_arg: &InputArg<String>) -> io::Result<()> {
     let input = Input::try_from(input_arg)?;
 
     let stdout = io::stdout();

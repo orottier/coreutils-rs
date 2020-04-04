@@ -46,7 +46,7 @@ fn main() -> ! {
 }
 
 /// `cat` implementation
-fn cat(input_args: &[InputArg], line_numbers: bool) {
+fn cat(input_args: &[InputArg<String>], line_numbers: bool) {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
