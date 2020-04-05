@@ -7,20 +7,17 @@
 //! Todo:
 //!  - support options
 
-use std::cmp::min;
 use std::convert::TryFrom;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process::exit;
-use std::thread;
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use coreutils::{print_help_and_exit, Input, InputArg};
+use coreutils::{Input, InputArg};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-const USAGE: &str =
+const _USAGE: &str =
     "pv [OPTION] [FILE]...\npv [-h|-V]\nmonitor the progress of data through a pipe";
 
 /// Parse arguments, run job, pass return code
