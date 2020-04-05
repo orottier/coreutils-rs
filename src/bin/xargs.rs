@@ -4,16 +4,16 @@
 //!
 //! Done:
 //!  - read params from stdin, separated by SEP
-//!  - execute commands
+//!  - execute commands, with max_args input
 //!
 //! Todo:
-//!  - run each command with multiple input args
 //!  - parallel execution
-//!  - every thing else
+//!  - everything else
 
 use coreutils::{Input, InputArg};
 use std::convert::TryFrom;
 use std::io::{self, BufRead, Write};
+use std::num::NonZeroU32;
 use std::process::exit;
 use std::process::Command;
 
@@ -22,7 +22,6 @@ use clap::{App, AppSettings, Arg};
 const USAGE: &str = "build and execute command lines from standard input";
 
 /// `xargs` payload
-#[derive(Debug)]
 struct Payload<'a> {
     /// run this command
     command: &'a str,
@@ -34,17 +33,29 @@ struct Payload<'a> {
     verbose: bool,
     /// separator of items in input stream
     input_sep: u8,
+    /// use at most MAX-ARGS arguments per command line
+    max_args: NonZeroU32,
 }
 
 impl<'a> Payload<'a> {
-    fn to_command(&self, input: String) -> Command {
+    fn to_command(&self, input: &mut dyn Iterator<Item = String>) -> Option<Command> {
         let mut cmd = Command::new(self.command);
+
         self.initial_args.iter().for_each(|arg| {
             cmd.arg(arg);
         });
-        cmd.arg(input);
 
-        cmd
+        let mut exhausted = true;
+        input.take(self.max_args.get() as _).for_each(|arg| {
+            exhausted = false;
+            cmd.arg(arg);
+        });
+
+        if exhausted {
+            return None;
+        }
+
+        Some(cmd)
     }
 }
 
@@ -74,6 +85,14 @@ fn main() -> ! {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("max-args")
+                .short("n")
+                .long("max-args")
+                .value_name("MAX-ARGS")
+                .help("use at most MAX-ARGS arguments per command line")
+                .takes_value(true),
+        )
+        .arg(
             Arg::with_name("COMMAND")
                 .help("run this command")
                 .required(true)
@@ -99,6 +118,11 @@ fn main() -> ! {
         .unwrap_or(vec![]);
     let verbose = matches.is_present("verbose");
     let input_sep = matches.value_of("null").map(|_| 0x0).unwrap_or(b'\n');
+    let max_args = matches
+        .value_of("max-args")
+        .and_then(|n| n.parse::<u32>().ok())
+        .and_then(|n| NonZeroU32::new(n))
+        .unwrap_or_else(|| NonZeroU32::new(5000).unwrap());
 
     let payload = Payload {
         command,
@@ -106,6 +130,7 @@ fn main() -> ! {
         input_arg,
         verbose,
         input_sep,
+        max_args,
     };
 
     match xargs(payload) {
@@ -128,25 +153,26 @@ fn xargs(payload: Payload) -> io::Result<()> {
     let stderr = io::stderr();
     let mut stderr = stderr.lock();
 
-    bufread
+    let mut iter = bufread
         .split(payload.input_sep)
         .flat_map(|line| line.ok())
-        .flat_map(|line| String::from_utf8(line).ok())
-        .try_for_each(|line| {
-            let mut cmd = payload.to_command(line);
-            if payload.verbose {
-                eprintln!("{:?}", cmd);
-            }
+        .flat_map(|line| String::from_utf8(line).ok());
 
-            match cmd.output() {
-                Ok(output) => stdout
-                    .write_all(&output.stdout)
-                    .and_then(|_| stderr.write_all(&output.stderr))
-                    .map(|_| ()),
-                Err(e) => Err(e),
-            }
-        })
-        .unwrap(); // todo, for borrow reasons do not return the io::Err
+    loop {
+        let mut cmd = match payload.to_command(&mut iter) {
+            Some(cmd) => cmd,
+            None => break,
+        };
+
+        if payload.verbose {
+            eprintln!("{:?}", cmd);
+        }
+
+        let output = cmd.output()?;
+        stdout
+            .write_all(&output.stdout)
+            .and_then(|_| stderr.write_all(&output.stderr))?;
+    }
 
     Ok(())
 }
