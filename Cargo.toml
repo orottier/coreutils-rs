@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 indicatif = "0.14.0"
+clap = "2.33.0"
 
 [profile.release]
 panic = "abort"
