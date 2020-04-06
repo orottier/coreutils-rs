@@ -7,7 +7,6 @@
 //!  - execute commands, with max_args input
 //!
 //! Todo:
-//!  - support `-I {}`
 //!  - less unwraps()
 //!  - other options
 
@@ -41,24 +40,45 @@ struct Payload<'a> {
     max_args: NonZeroU32,
     /// run at most MAX-PROCS processes at a time
     max_procs: NonZeroU32,
+    /// replace R in INITIAL-ARGS with names read from standard input
+    replace: Option<&'a str>,
 }
 
 impl<'a> Payload<'a> {
     fn to_command(&self, input: &mut dyn Iterator<Item = String>) -> Option<Command> {
         let mut cmd = Command::new(self.command);
 
+        // when running in replace mode, one of the initial args must be translated
+        let replacement = match self.replace {
+            None => None,
+            Some(_) => {
+                if let Some(arg_next) = input.next() {
+                    Some(arg_next)
+                } else {
+                    return None; // exhausted
+                }
+            }
+        };
+
         self.initial_args.iter().for_each(|arg| {
-            cmd.arg(arg);
+            if self.replace.as_ref() == Some(arg) {
+                cmd.arg(replacement.as_ref().unwrap());
+            } else {
+                cmd.arg(arg);
+            }
         });
 
-        let mut exhausted = true;
-        input.take(self.max_args.get() as _).for_each(|arg| {
-            exhausted = false;
-            cmd.arg(arg);
-        });
+        if self.replace.is_none() {
+            let count = input
+                .take(self.max_args.get() as _)
+                .map(|arg| {
+                    cmd.arg(arg);
+                })
+                .count();
 
-        if exhausted {
-            return None;
+            if count == 0 {
+                return None;
+            }
         }
 
         Some(cmd)
@@ -200,6 +220,14 @@ fn main() -> ! {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("replace")
+                .short("I")
+                .long("replace")
+                .value_name("R")
+                .help("replace R in INITIAL-ARGS with names read from standard input")
+                .takes_value(true),
+        )
+        .arg(
             Arg::with_name("COMMAND")
                 .help("run this command")
                 .required(true)
@@ -235,6 +263,18 @@ fn main() -> ! {
         .and_then(|n| n.parse::<u32>().ok())
         .and_then(NonZeroU32::new)
         .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+    let replace = matches.value_of("replace");
+
+    if let Some(placeholder) = replace {
+        if initial_args
+            .iter()
+            .find(|&arg| arg == &placeholder)
+            .is_none()
+        {
+            eprintln!("specified --replace but placeholder was not found");
+            exit(1)
+        }
+    }
 
     let payload = Payload {
         command,
@@ -244,6 +284,7 @@ fn main() -> ! {
         input_sep,
         max_args,
         max_procs,
+        replace,
     };
 
     match xargs(payload) {
