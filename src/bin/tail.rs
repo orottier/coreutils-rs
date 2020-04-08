@@ -4,19 +4,21 @@
 //! With no FILE, or when FILE is -, read standard input.
 //!
 //! Todo:
-//!  - support -f, --follow[={name|descriptor}] output appended data as the file grow
 //!  - tail multiple files
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::process::exit;
+use std::thread;
+use std::time::Duration;
 
 use coreutils::InputArg;
 
 use clap::{App, Arg};
 
 const USAGE: &str = "Print the last 10 lines of each FILE to standard output";
+const DEFAULT_BUF_SIZE: u64 = 2048;
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
@@ -54,7 +56,7 @@ fn main() -> ! {
         .and_then(|n| n.parse::<usize>().ok())
         .unwrap_or(10);
 
-    let follow = matches.value_of("follow").is_some();
+    let follow = matches.is_present("follow");
 
     let result = match input_arg {
         InputArg::File(filename) => tail_filename(filename, lines, follow),
@@ -94,18 +96,18 @@ fn tail_stdin(lines: usize) -> io::Result<()> {
 /// `tail` implementation for filename
 fn tail_filename(filename: &str, lines: usize, follow: bool) -> io::Result<()> {
     let mut file = File::open(filename)?;
-    let mut position = file.seek(SeekFrom::End(0))?;
+    let initial_position = file.seek(SeekFrom::End(0))?;
 
-    let chunk_size = 2048;
     let mut lines_found = 0;
     let mut tail = vec![];
 
     // read N lines back
+    let mut position = initial_position;
     loop {
-        let new_position = if position < chunk_size {
+        let new_position = if position < DEFAULT_BUF_SIZE {
             0
         } else {
-            position - chunk_size
+            position - DEFAULT_BUF_SIZE
         };
         let length = (position - new_position) as usize;
         position = new_position;
@@ -138,6 +140,18 @@ fn tail_filename(filename: &str, lines: usize, follow: bool) -> io::Result<()> {
 
     while let Some(chunk) = tail.pop() {
         stdout.write_all(&chunk)?;
+    }
+
+    if follow {
+        file.seek(SeekFrom::Start(initial_position))?;
+        loop {
+            let bytes = std::io::copy(&mut file, &mut stdout)?;
+            if bytes == 0 {
+                thread::sleep(Duration::from_millis(1000))
+            } else if bytes < DEFAULT_BUF_SIZE {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
     }
 
     Ok(())
