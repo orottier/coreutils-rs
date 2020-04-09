@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 indicatif = "0.14.0"
+ctrlc = "3.1.4"
 
 [dependencies.pnet]
 version = "0.25.0"
