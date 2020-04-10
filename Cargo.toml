@@ -19,4 +19,4 @@ default-features = false
 
 [profile.release]
 panic = "abort"
-lto = true
+#lto = true
