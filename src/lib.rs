@@ -40,10 +40,10 @@ impl<S: AsRef<Path>> TryFrom<&InputArg<S>> for Input {
 }
 
 impl Input {
-    pub fn as_bufread(&self) -> Box<dyn BufRead + '_> {
+    pub fn as_bufread(&self) -> impl BufRead + '_ {
         match &self {
-            Input::Stdin(stdin) => Box::new(stdin.lock()),
-            Input::File(file) => Box::new(BufReader::new(file)),
+            Input::Stdin(stdin) => Box::new(stdin.lock()) as Box<dyn BufRead>,
+            Input::File(file) => Box::new(BufReader::new(file)) as _,
         }
     }
 }
