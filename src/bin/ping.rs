@@ -149,7 +149,7 @@ fn listen_ipv6(mut rx: TransportReceiver, audible: bool, pings_recv: Arc<Mutex<V
             emit_bell();
         }
 
-        let echo_reply = Icmpv6Packet::new(packet.packet()).unwrap();
+        let _echo_reply = Icmpv6Packet::new(packet.packet()).unwrap();
         let sequence_number = 1; // TODO
 
         let mut lock = pings_recv.lock().unwrap();
@@ -181,7 +181,7 @@ fn build_ipv4_request<'a>(vec: &'a mut Vec<u8>, sequence_number: u16) -> impl Pa
     echo_packet
 }
 
-fn build_ipv6_request<'a>(vec: &'a mut Vec<u8>, sequence_number: u16) -> impl Packet + 'a {
+fn build_ipv6_request<'a>(vec: &'a mut Vec<u8>, _sequence_number: u16) -> impl Packet + 'a {
     let mut echo_packet = MutableIcmpv6Packet::new(&mut vec[..]).unwrap();
 
     echo_packet.set_icmpv6_type(Icmpv6Types::EchoRequest);
@@ -230,7 +230,8 @@ fn ping(
         IpAddr::V6(_) => listen_ipv6(rx, audible, pings_recv),
     });
 
-    println!("PING {} ({}): {} data bytes", dest, ip, 16);
+    let mut vec: Vec<u8> = vec![0; 16];
+    println!("PING {} ({}): {} data bytes", dest, ip, vec.len());
 
     // setup CTRL-C handler at this point, not earlier
     let running = Arc::new(AtomicBool::new(true));
@@ -239,7 +240,6 @@ fn ping(
         r.store(false, Ordering::SeqCst);
     })?;
 
-    let mut vec: Vec<u8> = vec![0; 16];
     while running.load(Ordering::SeqCst) {
         let sequence_number = {
             let mut pings = pings.lock().unwrap();
