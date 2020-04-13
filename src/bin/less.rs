@@ -5,38 +5,128 @@
 //! starting, so with large input files it starts up faster than text editors like vi (1)
 //!
 //! Todo:
-//!  - use memmap or clever seeking for large inputs
+//!  - handle terminal resize
 //!  - handle stdin, handle appears to close after draining bufread
-//!  - better line wrapping
 //!  - navigating: page up/down, search, tailing, etc
 //!  - many other things
 
+use termion::clear;
+use termion::cursor;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::screen::AlternateScreen;
 use termion::terminal_size;
 
-use std::convert::TryFrom;
-use std::io::{stdin, stdout, BufRead, Write};
+use memmap::{Mmap, MmapOptions};
+
+use std::fs::File;
+use std::io::{stdin, stdout, Write};
 use std::process::exit;
 
-use coreutils::{print_help_and_exit, Input, InputArg};
+use coreutils::{emit_bell, print_help_and_exit};
 
-const USAGE: &str = "less [FILE]: opposite of more";
+const USAGE: &str = "less <filename>: opposite of more";
+
+struct Pager {
+    mmap: Mmap,
+    offset: usize,
+}
+
+impl Pager {
+    fn new(mmap: Mmap) -> Self {
+        Self { mmap, offset: 0 }
+    }
+
+    fn jump_to_top(&mut self) -> bool {
+        if self.offset != 0 {
+            self.offset = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn jump_to_bottom(&mut self) -> bool {
+        if self.mmap.len() <= 1 {
+            return false;
+        }
+
+        let mut height = 10; // todo
+        let newline_pos = self.mmap[..(self.mmap.len() - 1)].iter().rposition(|c| {
+            if *c == b'\n' {
+                height -= 1;
+            }
+            height == 0
+        });
+        if let Some(index) = newline_pos {
+            let new_offset = index + 1;
+            if new_offset >= self.mmap.len() {
+                false
+            } else {
+                self.offset = new_offset;
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    fn scroll_down(&mut self) -> bool {
+        let newline_pos = self.mmap[self.offset..].iter().position(|c| *c == b'\n');
+        if let Some(index) = newline_pos {
+            let new_offset = self.offset + index + 1;
+            if new_offset >= self.mmap.len() {
+                false
+            } else {
+                self.offset = new_offset;
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    fn scroll_up(&mut self) -> bool {
+        if self.offset <= 1 {
+            return false;
+        }
+
+        let newline_pos = self.mmap[..(self.offset - 1)]
+            .iter()
+            .rposition(|c| *c == b'\n');
+        if let Some(index) = newline_pos {
+            let new_offset = index + 1;
+            self.offset = new_offset;
+        } else {
+            self.offset = 0;
+        }
+
+        true
+    }
+
+    fn view(&self, width: u16, height: u16) -> impl Iterator<Item = &[u8]> + '_ {
+        let chunk_size = width as usize;
+        self.mmap[self.offset..]
+            .split(|c| *c == b'\n')
+            .flat_map(move |cs| cs.chunks(chunk_size))
+            .chain(std::iter::repeat(&[b'~'][..]))
+            .take(height as usize)
+    }
+}
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
     let mut args = std::env::args();
     args.next(); // bin name
 
-    let input_arg = match args.next() {
+    let filename = match args.next() {
         Some(s) if s.starts_with('-') => print_help_and_exit(USAGE),
-        Some(s) => InputArg::File(s),
-        None => InputArg::Stdin,
+        Some(s) => s,
+        None => print_help_and_exit(USAGE),
     };
 
-    match less(&input_arg) {
+    match less(&filename) {
         Ok(_) => exit(0),
         Err(e) => {
             eprintln!("{:?}", e);
@@ -48,47 +138,27 @@ fn main() -> ! {
 /// Fill current screen with file content (with offset)
 fn draw_screen(
     stdout: &mut AlternateScreen<RawTerminal<std::io::Stdout>>,
-    lines: &[String],
-    offset: usize,
+    pager: &Pager,
     size: (u16, u16),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    write!(stdout, "{}", termion::clear::All)?;
+    write!(stdout, "{}", clear::All)?;
 
-    let term_width = size.0 as usize;
-    let max_lines = size.1 as usize - 1;
-
-    let mut term_line = 0;
-    let mut line_cursor = 0;
-    while term_line < max_lines {
-        // place cursor on right line
-        write!(stdout, "{}", termion::cursor::Goto(1, term_line as u16 + 1))?;
-
-        match lines.get(offset + line_cursor) {
-            None => {
-                write!(stdout, "~")?;
-                term_line += 1;
-            }
-            Some(line) => {
-                for start_slice in (0..line.len()).step_by(term_width) {
-                    let end_slice = (start_slice + term_width).min(line.len());
-                    write!(stdout, "{}", &line[start_slice..end_slice])?;
-                    term_line += 1;
-
-                    if term_line >= max_lines {
-                        break;
-                    }
-                    write!(stdout, "{}", termion::cursor::Goto(1, term_line as u16 + 1))?;
-                }
-                line_cursor += 1;
-            }
-        };
-    }
+    pager
+        .view(size.0, size.1 - 1)
+        .enumerate()
+        .for_each(|(line_number, line_content)| {
+            // place cursor on right line
+            write!(stdout, "{}", cursor::Goto(1, line_number as u16 + 1)).unwrap();
+            // write line
+            let line = std::str::from_utf8(line_content).unwrap_or("invalid UTF8");
+            write!(stdout, "{}", line).unwrap();
+        });
 
     // write status
     write!(
         stdout,
         "{}terminal size w{} h{}",
-        termion::cursor::Goto(1, size.1),
+        cursor::Goto(1, size.1),
         size.0,
         size.1
     )?;
@@ -99,56 +169,61 @@ fn draw_screen(
 }
 
 /// `less` implementation
-fn less(input_arg: &InputArg<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let input = Input::try_from(input_arg)?;
-    let lines: Vec<_> = input
-        .as_bufread()
-        .lines()
-        .filter_map(|line| line.ok())
-        .collect();
+fn less(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(filename)?;
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    let mut pager = Pager::new(mmap);
 
     let mut stdout = AlternateScreen::from(stdout().into_raw_mode()?);
-    write!(stdout, "{}", termion::cursor::Hide)?;
+    write!(stdout, "{}", cursor::Hide)?;
 
     let stdin = stdin();
     let stdin = stdin.lock();
 
     let size = terminal_size()?;
-    let mut offset = 0;
-    draw_screen(&mut stdout, &lines, offset, size)?;
+    draw_screen(&mut stdout, &pager, size)?;
 
     for c in stdin.keys() {
-        write!(
-            stdout,
-            "{}{}",
-            termion::cursor::Goto(1, size.1),
-            termion::clear::CurrentLine
-        )?;
+        write!(stdout, "",)?;
 
-        match c? {
+        let redraw = match c? {
             Key::Char('q') => break,
-            Key::Char(c) => write!(stdout, "{}", c)?,
-            Key::Alt(c) => write!(stdout, "^{}", c)?,
-            Key::Ctrl(c) => write!(stdout, "*{}", c)?,
-            Key::Esc => write!(stdout, "ESC")?,
-            Key::Up => {
-                if offset > 0 {
-                    offset -= 1;
-                    draw_screen(&mut stdout, &lines, offset, size)?;
-                }
+            Key::Char('g') => pager.jump_to_top(),
+            Key::Char('G') => pager.jump_to_bottom(),
+            Key::Char(c) => {
+                write!(
+                    stdout,
+                    "{}{}{}",
+                    cursor::Goto(1, size.1),
+                    clear::CurrentLine,
+                    c
+                )?;
+                stdout.flush()?;
+                false
             }
-            Key::Down => {
-                if offset < lines.len() {
-                    offset += 1;
-                    draw_screen(&mut stdout, &lines, offset, size)?;
-                }
+            Key::Esc => {
+                write!(
+                    stdout,
+                    "{}{}ESC",
+                    cursor::Goto(1, size.1),
+                    clear::CurrentLine
+                )?;
+                stdout.flush()?;
+                false
             }
-            _ => {}
+            Key::Up => pager.scroll_up(),
+            Key::Down => pager.scroll_down(),
+            _ => false,
+        };
+
+        if redraw {
+            draw_screen(&mut stdout, &pager, size)?;
+        } else {
+            emit_bell();
         }
-        stdout.flush()?;
     }
 
-    write!(stdout, "{}", termion::cursor::Show)?;
+    write!(stdout, "{}", cursor::Show)?;
 
     Ok(())
 }
