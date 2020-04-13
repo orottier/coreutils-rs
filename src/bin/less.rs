@@ -115,6 +115,92 @@ impl Pager {
     }
 }
 
+enum ReadlineState {
+    Initial,
+    Slash(String),
+    Number(i64),
+}
+enum ReadlineAction {
+    Status,
+    Exit,
+    JumpToTop,
+    JumpToBottom,
+    NextLine,
+    PrevLine,
+    Search(String),
+    Jump(i64),
+}
+
+use std::fmt;
+impl fmt::Display for ReadlineState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadlineState::Initial => write!(f, ":"),
+            ReadlineState::Slash(s) => write!(f, "search:{}", s),
+            ReadlineState::Number(i) => write!(f, "jump:{}", i),
+        }
+    }
+}
+
+impl ReadlineState {
+    fn next(&mut self, key: Key) -> Option<ReadlineAction> {
+        match self {
+            ReadlineState::Initial => match key {
+                Key::Ctrl('g') => Some(ReadlineAction::Status),
+                Key::Char('q') => Some(ReadlineAction::Exit),
+                Key::Char('g') => Some(ReadlineAction::JumpToTop),
+                Key::Char('G') => Some(ReadlineAction::JumpToBottom),
+                Key::Down => Some(ReadlineAction::NextLine),
+                Key::Up => Some(ReadlineAction::PrevLine),
+                Key::Char('/') => {
+                    *self = ReadlineState::Slash(String::new());
+                    None
+                }
+                Key::Char(c) if c > '0' && c <= '9' => {
+                    *self = ReadlineState::Number(c.to_digit(10).unwrap() as i64);
+                    None
+                }
+                _ => None,
+            },
+            ReadlineState::Slash(s) => match key {
+                Key::Esc => {
+                    *self = ReadlineState::Initial;
+                    None
+                }
+                Key::Char('\n') => {
+                    let search = s.clone();
+                    *self = ReadlineState::Initial;
+                    Some(ReadlineAction::Search(search))
+                }
+                Key::Char(c) => {
+                    s.push(c);
+                    Some(ReadlineAction::Search(s.clone()))
+                }
+                Key::Down => todo!(),
+                Key::Up => todo!(),
+                _ => None,
+            },
+            ReadlineState::Number(i) => match key {
+                Key::Esc => {
+                    *self = ReadlineState::Initial;
+                    None
+                }
+                Key::Char('\n') => {
+                    let jump = *i;
+                    *self = ReadlineState::Initial;
+                    Some(ReadlineAction::Jump(jump))
+                }
+                Key::Char(c) if c > '0' && c <= '9' => {
+                    let new = 10 * *i + c.to_digit(10).unwrap() as i64;
+                    *self = ReadlineState::Number(new);
+                    None
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
     let mut args = std::env::args();
@@ -136,7 +222,7 @@ fn main() -> ! {
 }
 
 /// Fill current screen with file content (with offset)
-fn draw_screen(
+fn draw_page(
     stdout: &mut AlternateScreen<RawTerminal<std::io::Stdout>>,
     pager: &Pager,
     size: (u16, u16),
@@ -153,16 +239,6 @@ fn draw_screen(
             let line = std::str::from_utf8(line_content).unwrap_or("invalid UTF8");
             write!(stdout, "{}", line).unwrap();
         });
-
-    // write status
-    write!(
-        stdout,
-        "{}terminal size w{} h{}",
-        cursor::Goto(1, size.1),
-        size.0,
-        size.1
-    )?;
-
     stdout.flush()?;
 
     Ok(())
@@ -180,47 +256,47 @@ fn less(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = stdin();
     let stdin = stdin.lock();
 
+    let mut readline = ReadlineState::Initial;
     let size = terminal_size()?;
-    draw_screen(&mut stdout, &pager, size)?;
+
+    draw_page(&mut stdout, &pager, size)?;
+    write!(
+        stdout,
+        "{}{}{}",
+        cursor::Goto(1, size.1),
+        clear::CurrentLine,
+        filename
+    )?;
+    stdout.flush()?;
 
     for c in stdin.keys() {
-        write!(stdout, "",)?;
-
-        let redraw = match c? {
-            Key::Char('q') => break,
-            Key::Char('g') => pager.jump_to_top(),
-            Key::Char('G') => pager.jump_to_bottom(),
-            Key::Char(c) => {
-                write!(
-                    stdout,
-                    "{}{}{}",
-                    cursor::Goto(1, size.1),
-                    clear::CurrentLine,
-                    c
-                )?;
-                stdout.flush()?;
-                false
+        let c = c?;
+        let action = readline.next(c);
+        if let Some(action) = action {
+            let redraw = match action {
+                ReadlineAction::Exit => break,
+                ReadlineAction::Status => true, // todo
+                ReadlineAction::JumpToTop => pager.jump_to_top(),
+                ReadlineAction::JumpToBottom => pager.jump_to_bottom(),
+                ReadlineAction::NextLine => pager.scroll_down(),
+                ReadlineAction::PrevLine => pager.scroll_up(),
+                ReadlineAction::Search(s) => true, // todo
+                ReadlineAction::Jump(s) => true,   // todo
+            };
+            if redraw {
+                draw_page(&mut stdout, &pager, size)?;
+            } else {
+                emit_bell();
             }
-            Key::Esc => {
-                write!(
-                    stdout,
-                    "{}{}ESC",
-                    cursor::Goto(1, size.1),
-                    clear::CurrentLine
-                )?;
-                stdout.flush()?;
-                false
-            }
-            Key::Up => pager.scroll_up(),
-            Key::Down => pager.scroll_down(),
-            _ => false,
-        };
-
-        if redraw {
-            draw_screen(&mut stdout, &pager, size)?;
-        } else {
-            emit_bell();
         }
+        write!(
+            stdout,
+            "{}{}{}",
+            cursor::Goto(1, size.1),
+            clear::CurrentLine,
+            readline
+        )?;
+        stdout.flush()?;
     }
 
     write!(stdout, "{}", cursor::Show)?;
