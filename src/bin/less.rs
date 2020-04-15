@@ -5,20 +5,20 @@
 //! starting, so with large input files it starts up faster than text editors like vi (1)
 //!
 //! Todo:
+//!  - search backwards
 //!  - handle terminal resize
 //!  - handle stdin, handle appears to close after draining bufread
-//!  - navigating: page up/down, search, tailing, etc
+//!  - page up/down, tailing, etc
 //!  - many other things
 
-use termion::clear;
-use termion::cursor;
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::{IntoRawMode, RawTerminal};
 use termion::screen::AlternateScreen;
-use termion::terminal_size;
+use termion::{clear, color, cursor, terminal_size};
 
 use memmap::{Mmap, MmapOptions};
+use regex::bytes::Regex;
 
 use std::fs::File;
 use std::io::{stdin, stdout, Write};
@@ -30,17 +30,27 @@ const USAGE: &str = "less <filename>: opposite of more";
 
 struct Pager {
     mmap: Mmap,
-    offset: usize,
+    size: (u16, u16),
+    scroll_pos: usize,
+    cursor: usize,
+    search: Option<Regex>,
 }
 
 impl Pager {
-    fn new(mmap: Mmap) -> Self {
-        Self { mmap, offset: 0 }
+    fn new(mmap: Mmap, size: (u16, u16)) -> Self {
+        Self {
+            mmap,
+            size,
+            scroll_pos: 0,
+            cursor: 0,
+            search: None,
+        }
     }
 
     fn jump_to_top(&mut self) -> bool {
-        if self.offset != 0 {
-            self.offset = 0;
+        if self.scroll_pos != 0 {
+            self.scroll_pos = 0;
+            self.cursor = 0;
             true
         } else {
             false
@@ -60,11 +70,12 @@ impl Pager {
             height == 0
         });
         if let Some(index) = newline_pos {
-            let new_offset = index + 1;
-            if new_offset >= self.mmap.len() {
+            let new_scroll_pos = index + 1;
+            if new_scroll_pos >= self.mmap.len() {
                 false
             } else {
-                self.offset = new_offset;
+                self.scroll_pos = new_scroll_pos;
+                self.cursor = new_scroll_pos;
                 true
             }
         } else {
@@ -73,13 +84,16 @@ impl Pager {
     }
 
     fn scroll_down(&mut self) -> bool {
-        let newline_pos = self.mmap[self.offset..].iter().position(|c| *c == b'\n');
+        let newline_pos = self.mmap[self.scroll_pos..]
+            .iter()
+            .position(|c| *c == b'\n');
         if let Some(index) = newline_pos {
-            let new_offset = self.offset + index + 1;
-            if new_offset >= self.mmap.len() {
+            let new_scroll_pos = self.scroll_pos + index + 1;
+            if new_scroll_pos >= self.mmap.len() {
                 false
             } else {
-                self.offset = new_offset;
+                self.scroll_pos = new_scroll_pos;
+                self.cursor = new_scroll_pos;
                 true
             }
         } else {
@@ -88,30 +102,134 @@ impl Pager {
     }
 
     fn scroll_up(&mut self) -> bool {
-        if self.offset <= 1 {
+        if self.scroll_pos <= 1 {
             return false;
         }
 
-        let newline_pos = self.mmap[..(self.offset - 1)]
+        let newline_pos = self.mmap[..(self.scroll_pos - 1)]
             .iter()
             .rposition(|c| *c == b'\n');
         if let Some(index) = newline_pos {
-            let new_offset = index + 1;
-            self.offset = new_offset;
+            let new_scroll_pos = index + 1;
+            self.scroll_pos = new_scroll_pos;
+            self.cursor = new_scroll_pos;
         } else {
-            self.offset = 0;
+            self.scroll_pos = 0;
+            self.cursor = 0;
         }
 
         true
     }
 
-    fn view(&self, width: u16, height: u16) -> impl Iterator<Item = &[u8]> + '_ {
-        let chunk_size = width as usize;
-        self.mmap[self.offset..]
+    fn search(&mut self, search: &str) -> bool {
+        self.search = Regex::new(search).ok();
+        self.cursor = self.scroll_pos;
+        self.search_next();
+
+        true // always redraw since the search query may change
+    }
+
+    fn search_next(&mut self) -> bool {
+        let regex = match &self.search {
+            None => return false,
+            Some(regex) => regex,
+        };
+
+        if let Some(mat) = regex.find(&self.mmap[(self.cursor + 1)..]) {
+            let new_pos = self.cursor + mat.start() + 1;
+            self.scroll_pos = new_pos;
+            self.scroll_up();
+            self.cursor = new_pos;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_prev(&mut self) -> bool {
+        let regex = match &self.search {
+            None => return false,
+            Some(regex) => regex,
+        };
+
+        todo!()
+    }
+
+    fn draw_onto(
+        &self,
+        stdout: &mut AlternateScreen<RawTerminal<std::io::Stdout>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        write!(stdout, "{}", clear::All)?;
+
+        let chunk_size = self.size.0 as usize;
+        let height = self.size.1 as usize;
+
+        self.mmap[self.scroll_pos..]
             .split(|c| *c == b'\n')
-            .flat_map(move |cs| cs.chunks(chunk_size))
+            .flat_map(move |cs| {
+                if cs.is_empty() {
+                    // placeholder to prevent flat_map from dropping empty lines
+                    [b'\n'].chunks(1)
+                } else {
+                    cs.chunks(chunk_size)
+                }
+            })
             .chain(std::iter::repeat(&[b'~'][..]))
-            .take(height as usize)
+            .take(height)
+            .enumerate()
+            .for_each(|(line, bytes)| {
+                write!(stdout, "{}", cursor::Goto(1, (line + 1) as _)).unwrap();
+
+                let mut cut = 0;
+                if let Some(matches) = self.search.as_ref().map(|regex| regex.find_iter(bytes)) {
+                    matches.for_each(|m| {
+                        stdout.write_all(&bytes[cut..m.start()]).unwrap();
+                        write!(
+                            stdout,
+                            "{}{}",
+                            color::Bg(color::Black),
+                            color::Fg(color::LightWhite)
+                        )
+                        .unwrap();
+                        stdout.write_all(&bytes[m.start()..m.end()]).unwrap();
+                        write!(
+                            stdout,
+                            "{}{}",
+                            color::Bg(color::Reset),
+                            color::Fg(color::Reset)
+                        )
+                        .unwrap();
+                        cut = m.end();
+                    });
+                }
+
+                stdout.write_all(&bytes[cut..]).unwrap();
+            });
+
+        stdout.flush()?;
+
+        Ok(())
+    }
+
+    fn draw_status(
+        &self,
+        stdout: &mut AlternateScreen<RawTerminal<std::io::Stdout>>,
+        status: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        write!(
+            stdout,
+            "{}{}{}{}{}{}{}",
+            cursor::Goto(1, self.size.1),
+            clear::CurrentLine,
+            color::Bg(color::Black),
+            color::Fg(color::LightWhite),
+            status,
+            color::Bg(color::Reset),
+            color::Fg(color::Reset),
+        )?;
+        stdout.flush()?;
+
+        Ok(())
     }
 }
 
@@ -120,7 +238,7 @@ enum ReadlineState {
     Slash(String),
     Number(i64),
 }
-enum ReadlineAction {
+enum Action {
     Status,
     Exit,
     JumpToTop,
@@ -128,6 +246,8 @@ enum ReadlineAction {
     NextLine,
     PrevLine,
     Search(String),
+    SearchNext,
+    SearchPrev,
     Jump(i64),
 }
 
@@ -143,15 +263,21 @@ impl fmt::Display for ReadlineState {
 }
 
 impl ReadlineState {
-    fn next(&mut self, key: Key) -> Option<ReadlineAction> {
+    fn next(&mut self, key: Key) -> Option<Action> {
         match self {
             ReadlineState::Initial => match key {
-                Key::Ctrl('g') => Some(ReadlineAction::Status),
-                Key::Char('q') => Some(ReadlineAction::Exit),
-                Key::Char('g') => Some(ReadlineAction::JumpToTop),
-                Key::Char('G') => Some(ReadlineAction::JumpToBottom),
-                Key::Down => Some(ReadlineAction::NextLine),
-                Key::Up => Some(ReadlineAction::PrevLine),
+                Key::Char('G') => Some(Action::JumpToBottom),
+                Key::Char('N') => Some(Action::SearchPrev),
+                Key::Char('g') => Some(Action::JumpToTop),
+                Key::Char('j') => Some(Action::NextLine),
+                Key::Char('k') => Some(Action::PrevLine),
+                Key::Char('n') => Some(Action::SearchNext),
+                Key::Char('q') => Some(Action::Exit),
+                Key::Ctrl('g') => Some(Action::Status),
+
+                Key::Down => Some(Action::NextLine),
+                Key::Up => Some(Action::PrevLine),
+
                 Key::Char('/') => {
                     *self = ReadlineState::Slash(String::new());
                     None
@@ -167,14 +293,28 @@ impl ReadlineState {
                     *self = ReadlineState::Initial;
                     None
                 }
+                Key::Backspace => {
+                    s.pop();
+                    if s.is_empty() {
+                        *self = ReadlineState::Initial;
+                        None
+                    } else {
+                        Some(Action::Search(s.clone()))
+                    }
+                }
                 Key::Char('\n') => {
                     let search = s.clone();
                     *self = ReadlineState::Initial;
-                    Some(ReadlineAction::Search(search))
+                    Some(Action::Search(search))
                 }
                 Key::Char(c) => {
                     s.push(c);
-                    Some(ReadlineAction::Search(s.clone()))
+
+                    if s.chars().filter(|c| *c != '.').count() == 0 {
+                        None // do not search this pattern
+                    } else {
+                        Some(Action::Search(s.clone()))
+                    }
                 }
                 Key::Down => todo!(),
                 Key::Up => todo!(),
@@ -188,7 +328,7 @@ impl ReadlineState {
                 Key::Char('\n') => {
                     let jump = *i;
                     *self = ReadlineState::Initial;
-                    Some(ReadlineAction::Jump(jump))
+                    Some(Action::Jump(jump))
                 }
                 Key::Char(c) if c > '0' && c <= '9' => {
                     let new = 10 * *i + c.to_digit(10).unwrap() as i64;
@@ -221,34 +361,13 @@ fn main() -> ! {
     }
 }
 
-/// Fill current screen with file content (with offset)
-fn draw_page(
-    stdout: &mut AlternateScreen<RawTerminal<std::io::Stdout>>,
-    pager: &Pager,
-    size: (u16, u16),
-) -> Result<(), Box<dyn std::error::Error>> {
-    write!(stdout, "{}", clear::All)?;
-
-    pager
-        .view(size.0, size.1 - 1)
-        .enumerate()
-        .for_each(|(line_number, line_content)| {
-            // place cursor on right line
-            write!(stdout, "{}", cursor::Goto(1, line_number as u16 + 1)).unwrap();
-            // write line
-            let line = std::str::from_utf8(line_content).unwrap_or("invalid UTF8");
-            write!(stdout, "{}", line).unwrap();
-        });
-    stdout.flush()?;
-
-    Ok(())
-}
-
 /// `less` implementation
 fn less(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(filename)?;
     let mmap = unsafe { MmapOptions::new().map(&file)? };
-    let mut pager = Pager::new(mmap);
+    let size = terminal_size()?;
+
+    let mut pager = Pager::new(mmap, size);
 
     let mut stdout = AlternateScreen::from(stdout().into_raw_mode()?);
     write!(stdout, "{}", cursor::Hide)?;
@@ -257,46 +376,32 @@ fn less(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = stdin.lock();
 
     let mut readline = ReadlineState::Initial;
-    let size = terminal_size()?;
-
-    draw_page(&mut stdout, &pager, size)?;
-    write!(
-        stdout,
-        "{}{}{}",
-        cursor::Goto(1, size.1),
-        clear::CurrentLine,
-        filename
-    )?;
-    stdout.flush()?;
+    pager.draw_onto(&mut stdout)?;
+    pager.draw_status(&mut stdout, filename)?;
 
     for c in stdin.keys() {
         let c = c?;
         let action = readline.next(c);
         if let Some(action) = action {
             let redraw = match action {
-                ReadlineAction::Exit => break,
-                ReadlineAction::Status => true, // todo
-                ReadlineAction::JumpToTop => pager.jump_to_top(),
-                ReadlineAction::JumpToBottom => pager.jump_to_bottom(),
-                ReadlineAction::NextLine => pager.scroll_down(),
-                ReadlineAction::PrevLine => pager.scroll_up(),
-                ReadlineAction::Search(s) => true, // todo
-                ReadlineAction::Jump(s) => true,   // todo
+                Action::Exit => break,
+                Action::Status => true, // todo
+                Action::JumpToTop => pager.jump_to_top(),
+                Action::JumpToBottom => pager.jump_to_bottom(),
+                Action::NextLine => pager.scroll_down(),
+                Action::PrevLine => pager.scroll_up(),
+                Action::SearchNext => pager.search_next(),
+                Action::SearchPrev => pager.search_prev(),
+                Action::Search(s) => pager.search(&s),
+                Action::Jump(s) => true, // todo
             };
             if redraw {
-                draw_page(&mut stdout, &pager, size)?;
+                pager.draw_onto(&mut stdout)?;
             } else {
                 emit_bell();
             }
         }
-        write!(
-            stdout,
-            "{}{}{}",
-            cursor::Goto(1, size.1),
-            clear::CurrentLine,
-            readline
-        )?;
-        stdout.flush()?;
+        pager.draw_status(&mut stdout, &format!("{}", readline))?;
     }
 
     write!(stdout, "{}", cursor::Show)?;
