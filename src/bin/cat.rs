@@ -59,11 +59,11 @@ fn cat(input_args: &[InputArg<String>], line_numbers: bool) {
                 })
                 .ok()
         })
-        .for_each(|input| {
+        .map(|input| input.into_bufread())
+        .for_each(|mut input| {
             let result = if line_numbers {
                 let mut n = 0u32;
                 input
-                    .as_bufread()
                     .lines()
                     .flat_map(|line| line.ok())
                     .try_for_each(|line| {
@@ -71,7 +71,7 @@ fn cat(input_args: &[InputArg<String>], line_numbers: bool) {
                         stdout.write_fmt(format_args!("{:>6} {}\n", n, line))
                     })
             } else {
-                io::copy(&mut input.as_bufread(), &mut stdout).map(|_| ())
+                io::copy(&mut input, &mut stdout).map(|_| ())
             };
 
             if result.is_err() {
