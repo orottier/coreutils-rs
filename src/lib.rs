@@ -46,6 +46,13 @@ impl Input {
             Input::File(file) => Box::new(BufReader::new(file)) as _,
         }
     }
+
+    pub fn into_bufread(self) -> impl BufRead {
+        match self {
+            Input::Stdin(stdin) => Box::new(BufReader::new(stdin)) as Box<dyn BufRead>,
+            Input::File(file) => Box::new(BufReader::new(file)) as _,
+        }
+    }
 }
 
 pub enum OutputArg<S: AsRef<Path>> {
