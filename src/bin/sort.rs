@@ -11,9 +11,13 @@
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Split, Write};
-use std::num::NonZeroU32;
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::process::exit;
+use std::time::Instant;
+
+use std::io::Split;
+use std::vec::IntoIter;
 
 use coreutils::{Input, InputArg};
 
@@ -33,8 +37,25 @@ enum SortOrder {
     // ...
 }
 
+#[derive(Debug)]
+enum LineIterator {
+    File(Split<BufReader<File>>),
+    Vec(IntoIter<Line>),
+}
+impl Iterator for LineIterator {
+    type Item = Line;
+
+    fn next(&mut self) -> Option<Line> {
+        match self {
+            LineIterator::File(iter) => iter.next().map(|l| l.expect("I/O").into_boxed_slice()),
+            LineIterator::Vec(iter) => iter.next(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SortedChunk {
-    source: Split<BufReader<File>>,
+    source: LineIterator,
     head: Option<Line>,
 }
 
@@ -42,20 +63,52 @@ impl Iterator for SortedChunk {
     type Item = Line;
 
     fn next(&mut self) -> Option<Line> {
-        let next = self.source.next().map(|l| l.unwrap().into_boxed_slice());
+        let next = self.source.next();
         std::mem::replace(&mut self.head, next)
     }
 }
 
 impl SortedChunk {
-    pub fn file(file: File) -> Self {
+    pub fn new(lines: Vec<Line>) -> Self {
+        let iter = lines.into_iter();
+
         let mut me = Self {
-            source: BufReader::new(file).split(b'\n'),
+            source: LineIterator::Vec(iter),
             head: None,
         };
+
         me.next();
 
         me
+    }
+
+    pub fn flush_to_disk(&mut self) {
+        // no-op if already file
+        if let LineIterator::File(_) = self.source {
+            return;
+        }
+
+        let mut tempfile = tempfile().unwrap();
+        {
+            let mut write = BufWriter::new(&mut tempfile);
+            self.source
+                .try_for_each(|line| {
+                    write
+                        .write_all(&line)
+                        .and_then(|_| write.write_all(&[b'\n']))
+                })
+                .unwrap();
+        }
+        tempfile.seek(SeekFrom::Start(0)).unwrap();
+
+        let iter = BufReader::new(tempfile).split(b'\n');
+
+        *self = Self {
+            source: LineIterator::File(iter),
+            head: None,
+        };
+
+        self.next();
     }
 
     fn peek(&self) -> Option<&Line> {
@@ -73,8 +126,6 @@ impl SortedChunk {
 
     pub fn drain_until<W: Write>(&mut self, stdout: &mut W, limit: &Line) -> bool {
         while let Some(head) = self.next() {
-            //eprintln!("head {} limit {}", std::str::from_utf8(&head).unwrap(), std::str::from_utf8(&limit).unwrap());
-
             stdout
                 .write_all(&head)
                 .and_then(|_| stdout.write_all(&[b'\n']))
@@ -130,6 +181,14 @@ fn main() -> ! {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("buffer-size")
+                .long("buffer-size")
+                .value_name("SIZE")
+                .short("S")
+                .help("use SIZE for main memory buffer")
+                .takes_value(true),
+        )
+        .arg(
             Arg::with_name("FILE")
                 .help("sort FILE(s), use - for stdin")
                 .multiple(true)
@@ -163,16 +222,26 @@ fn main() -> ! {
 
     let batch_size = matches
         .value_of("batch-size")
-        .and_then(|n| n.parse::<u32>().ok())
-        .and_then(NonZeroU32::new);
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new);
 
-    sort(&inputs[..], sort_order, batch_size);
+    let buffer_size = matches
+        .value_of("buffer-size")
+        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new);
+
+    sort(&inputs[..], sort_order, batch_size, buffer_size);
     exit(0)
 }
 
 /// `sort` handler
-fn sort(input_args: &[InputArg<&str>], _sort_order: SortOrder, batch_size: Option<NonZeroU32>) {
-    let line_iter = input_args
+fn sort(
+    input_args: &[InputArg<&str>],
+    _sort_order: SortOrder,
+    batch_size: Option<NonZeroUsize>,
+    buffer_size: Option<NonZeroUsize>,
+) {
+    let mut line_iter = input_args
         .iter()
         .flat_map(|input_arg| {
             Input::try_from(input_arg)
@@ -185,43 +254,26 @@ fn sort(input_args: &[InputArg<&str>], _sort_order: SortOrder, batch_size: Optio
         .flat_map(|line| line.ok())
         .map(|line| line.into_boxed_slice()); // save bytes by dropping cap field
 
-    match batch_size {
-        None => sort_in_mem(line_iter),
-        Some(batch_size) => sort_external(line_iter, batch_size),
-    }
-}
-
-fn sort_in_mem(mut line_iter: impl Iterator<Item = Line>) {
-    let mut lines: Vec<_> = line_iter.collect();
-    lines.sort_unstable();
-
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-
-    lines
-        .into_iter()
-        .try_for_each(|line| {
-            stdout
-                .write_all(&line)
-                .and_then(|_| stdout.write_all(&[b'\n']))
-        })
-        .unwrap();
-}
-
-fn sort_external(mut line_iter: impl Iterator<Item = Line>, batch_size: NonZeroU32) {
-    let batch_size = batch_size.get();
-    eprintln!("running with batch_size {}", batch_size);
+    let batch_size = batch_size.map(|b| b.get()).unwrap_or(usize::max_value());
+    let buffer_size = buffer_size.map(|b| b.get()).unwrap_or(usize::max_value());
+    eprintln!(
+        "batch_size {}k, buffer_size {}M",
+        batch_size >> 10,
+        buffer_size >> 20
+    );
 
     let mut exhausted = false;
-    let mut files = vec![];
-    let now = std::time::Instant::now();
+    let mut bytes = 0;
+    let mut chunks = vec![];
+    let now = Instant::now();
 
-    let mut lines = vec![];
     while !exhausted {
+        let mut lines = vec![];
         let mut count = 0;
 
         while count < batch_size {
             if let Some(line) = line_iter.next() {
+                bytes += line.len();
                 lines.push(line);
             } else {
                 exhausted = true;
@@ -229,51 +281,38 @@ fn sort_external(mut line_iter: impl Iterator<Item = Line>, batch_size: NonZeroU
             }
             count += 1;
         }
-
         eprintln!(
-            "{} - collected {} lines",
-            std::time::Instant::now().duration_since(now).as_millis(),
+            "{:>5} - collected {} lines",
+            Instant::now().duration_since(now).as_millis(),
             count
         );
+
         lines.sort_unstable();
         eprintln!(
-            "{} - sorted",
-            std::time::Instant::now().duration_since(now).as_millis()
+            "{:>5} - sorted",
+            Instant::now().duration_since(now).as_millis()
         );
 
-        let mut tempfile = tempfile().unwrap();
-        {
-            let mut write = BufWriter::new(&mut tempfile);
-            lines
-                .iter()
-                .try_for_each(|line| {
-                    write
-                        .write_all(line)
-                        .and_then(|_| write.write_all(&[b'\n']))
-                })
-                .unwrap();
+        let chunk = SortedChunk::new(lines);
+
+        if !exhausted && bytes > buffer_size {
+            chunks
+                .iter_mut()
+                .for_each(|c: &mut SortedChunk| c.flush_to_disk());
+            eprintln!(
+                "{:>5} - flushed all to disk",
+                Instant::now().duration_since(now).as_millis()
+            );
+            bytes = 0;
         }
 
-        eprintln!(
-            "{} - written tempfile {:?}",
-            std::time::Instant::now().duration_since(now).as_millis(),
-            tempfile
-        );
-        files.push(tempfile);
-
-        lines.clear(); // re-use allocated vec
+        chunks.push(chunk);
     }
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
-    let mut chunks: BinaryHeap<_> = files
-        .into_iter()
-        .map(|mut tempfile| {
-            tempfile.seek(SeekFrom::Start(0)).unwrap();
-            SortedChunk::file(tempfile)
-        })
-        .collect();
+    let mut chunks: BinaryHeap<_> = chunks.into_iter().collect();
 
     while let Some(mut chunk) = chunks.pop() {
         let exhausted = match chunks.peek().and_then(|c| c.peek()) {
@@ -289,7 +328,7 @@ fn sort_external(mut line_iter: impl Iterator<Item = Line>, batch_size: NonZeroU
     }
 
     eprintln!(
-        "{} - done",
-        std::time::Instant::now().duration_since(now).as_millis()
+        "{:>5} - done",
+        Instant::now().duration_since(now).as_millis()
     );
 }
