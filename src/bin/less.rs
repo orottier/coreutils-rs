@@ -147,7 +147,7 @@ impl Pager {
     }
 
     fn search_prev(&mut self) -> bool {
-        let regex = match &self.search {
+        let _regex = match &self.search {
             None => return false,
             Some(regex) => regex,
         };
@@ -393,7 +393,7 @@ fn less(filename: &str) -> Result<(), Box<dyn std::error::Error>> {
                 Action::SearchNext => pager.search_next(),
                 Action::SearchPrev => pager.search_prev(),
                 Action::Search(s) => pager.search(&s),
-                Action::Jump(s) => true, // todo
+                Action::Jump(_s) => true, // todo
             };
             if redraw {
                 pager.draw_onto(&mut stdout)?;

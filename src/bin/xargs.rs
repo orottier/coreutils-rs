@@ -69,6 +69,7 @@ impl<'a> Payload<'a> {
         });
 
         if self.replace.is_none() {
+            #[allow(clippy::suspicious_map)]
             let count = input
                 .take(self.max_args.get() as _)
                 .map(|arg| {
@@ -250,7 +251,7 @@ fn main() -> ! {
     let initial_args = matches
         .values_of("INITIAL_ARGS")
         .map(|values| values.collect())
-        .unwrap_or_else(|| vec![]);
+        .unwrap_or_else(Vec::new);
     let verbose = matches.is_present("verbose");
     let input_sep = matches.value_of("null").map(|_| 0x0).unwrap_or(b'\n');
     let max_args = matches
