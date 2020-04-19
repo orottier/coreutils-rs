@@ -15,10 +15,8 @@ use std::io::{self, BufRead, Write};
 use std::num::NonZeroU32;
 use std::process::exit;
 use std::process::Command;
-use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 
+use coreutils::executor::{Executor, Job, ThreadPool};
 use coreutils::io::{Input, InputArg};
 
 use clap::{App, AppSettings, Arg};
@@ -46,7 +44,7 @@ struct Payload<'a> {
 }
 
 impl<'a> Payload<'a> {
-    fn to_command(&self, input: &mut dyn Iterator<Item = String>) -> Option<Command> {
+    fn create_job(&self, input: &mut dyn Iterator<Item = String>) -> Option<XargsJob> {
         let mut cmd = Command::new(self.command);
 
         // when running in replace mode, one of the initial args must be translated
@@ -83,15 +81,15 @@ impl<'a> Payload<'a> {
             }
         }
 
-        Some(cmd)
+        Some(XargsJob(cmd))
     }
 }
 
 /// Convenience wrapper for a Command,
 /// that writes its output to the main stdout and stderr
-struct Job(Command);
+struct XargsJob(Command);
 
-impl Job {
+impl Job for XargsJob {
     fn run(self) {
         let mut cmd = self.0;
         // we don't use spawn, but capture full output
@@ -107,76 +105,6 @@ impl Job {
             .write_all(&output.stdout)
             .and_then(|_| stderr.write_all(&output.stderr))
             .expect("Error writing output");
-    }
-}
-
-/// Threadpool implementation for parallel execution
-struct ThreadPool {
-    /// worker threads
-    threads: Vec<JoinHandle<()>>,
-    /// job submission channel, blocks if queue is full
-    sender: SyncSender<Job>,
-}
-
-impl ThreadPool {
-    fn new(size: NonZeroU32) -> Self {
-        let size = size.get();
-        let (sender, receiver) = sync_channel::<Job>(size as _);
-        let receiver = Arc::new(Mutex::new(receiver));
-
-        let threads = (0..size)
-            .map(|_| {
-                let thread_recv = receiver.clone();
-                thread::spawn(move || {
-                    // keep working, as long as we are able to `recv` jobs
-                    while let Ok(job) = thread_recv.lock().unwrap().recv() {
-                        job.run();
-                    }
-                })
-            })
-            .collect();
-
-        Self { threads, sender }
-    }
-
-    fn submit(&mut self, job: Job) {
-        self.sender.send(job).unwrap()
-    }
-
-    fn finish(self) {
-        let ThreadPool {
-            threads, sender, ..
-        } = self;
-        drop(sender); // signal receivers they can exit
-
-        threads
-            .into_iter()
-            .for_each(|thread| thread.join().unwrap())
-    }
-}
-
-/// Executor for running command batches
-enum Executor {
-    /// single-threaded, no overhead
-    Synchronous,
-    /// multi-threaded
-    Concurrent(ThreadPool),
-}
-
-impl Executor {
-    fn submit(&mut self, cmd: Command) {
-        let job = Job(cmd);
-        match self {
-            Executor::Synchronous => job.run(), // run immediately
-            Executor::Concurrent(thread_pool) => thread_pool.submit(job),
-        }
-    }
-
-    fn finish(self) {
-        match self {
-            Executor::Synchronous => (),
-            Executor::Concurrent(thread_pool) => thread_pool.finish(),
-        }
     }
 }
 
@@ -313,9 +241,9 @@ fn xargs(payload: Payload) -> io::Result<()> {
         _ => Executor::Concurrent(ThreadPool::new(payload.max_procs)),
     };
 
-    while let Some(cmd) = payload.to_command(&mut iter) {
+    while let Some(cmd) = payload.create_job(&mut iter) {
         if payload.verbose {
-            eprintln!("{:?}", cmd);
+            eprintln!("{:?}", cmd.0);
         }
 
         executor.submit(cmd);
