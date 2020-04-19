@@ -8,7 +8,7 @@
 //!  - report ttl, damaged replies
 //!  - all other options
 
-use coreutils::{emit_bell, print_help_and_exit};
+use coreutils::util::{emit_bell, print_help_and_exit};
 
 use std::net::IpAddr;
 use std::net::ToSocketAddrs;

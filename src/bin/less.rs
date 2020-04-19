@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{stdin, stdout, Write};
 use std::process::exit;
 
-use coreutils::{emit_bell, print_help_and_exit};
+use coreutils::util::{emit_bell, print_help_and_exit};
 
 const USAGE: &str = "less <filename>: opposite of more";
 

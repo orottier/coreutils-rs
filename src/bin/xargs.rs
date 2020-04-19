@@ -10,7 +10,6 @@
 //!  - less unwraps()
 //!  - other options
 
-use coreutils::{Input, InputArg};
 use std::convert::TryFrom;
 use std::io::{self, BufRead, Write};
 use std::num::NonZeroU32;
@@ -19,6 +18,8 @@ use std::process::Command;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+
+use coreutils::io::{Input, InputArg};
 
 use clap::{App, AppSettings, Arg};
 

@@ -10,7 +10,8 @@ use std::convert::TryFrom;
 use std::io::{self, BufRead, Write};
 use std::process::exit;
 
-use coreutils::{print_help_and_exit, Output, OutputArg};
+use coreutils::io::{Output, OutputArg};
+use coreutils::util::print_help_and_exit;
 
 const USAGE: &str =
     "tee [OPTION]... [FILE]...\nread from standard input and write to standard output and files";

@@ -9,7 +9,8 @@ use std::convert::TryFrom;
 use std::io::{self, BufRead, Write};
 use std::process::exit;
 
-use coreutils::{print_help_and_exit, Input, InputArg};
+use coreutils::io::{Input, InputArg};
+use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "cat [OPTION]... [FILE]... : concatenate FILE(s) to standard output";
 

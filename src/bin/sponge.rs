@@ -13,7 +13,8 @@ use std::convert::TryFrom;
 use std::io::{self, Read, Write};
 use std::process::exit;
 
-use coreutils::{print_help_and_exit, Output, OutputArg};
+use coreutils::io::{Output, OutputArg};
+use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "sponge [-a] <file>: soak up all input from stdin and write it to <file>";
 

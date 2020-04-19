@@ -13,7 +13,7 @@ use std::process::exit;
 use std::thread;
 use std::time::Duration;
 
-use coreutils::InputArg;
+use coreutils::io::InputArg;
 
 use clap::{App, Arg};
 

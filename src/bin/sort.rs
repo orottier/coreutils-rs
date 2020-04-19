@@ -19,7 +19,7 @@ use std::time::Instant;
 use std::io::Split;
 use std::vec::IntoIter;
 
-use coreutils::{Input, InputArg};
+use coreutils::io::{Input, InputArg};
 
 use clap::{App, Arg};
 use tempfile::tempfile;

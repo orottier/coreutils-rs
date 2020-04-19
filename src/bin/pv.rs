@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 use std::process::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use coreutils::{Input, InputArg};
+use coreutils::io::{Input, InputArg};
 
 use indicatif::{ProgressBar, ProgressStyle};
 
