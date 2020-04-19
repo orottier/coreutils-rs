@@ -28,6 +28,19 @@ const USAGE: &str = "Sort lines of text files";
 
 type Line = Box<[u8]>;
 
+/// `sort` payload
+#[allow(dead_code)]
+struct Payload<'a> {
+    /// sort these inputs
+    inputs: Vec<InputArg<&'a str>>,
+    /// sort order
+    sort_order: SortOrder,
+    /// merge at most N inputs at once
+    batch_size: Option<NonZeroUsize>,
+    /// main memory buffer size
+    buffer_size: Option<NonZeroUsize>,
+}
+
 #[allow(dead_code)]
 enum SortOrder {
     Locale,
@@ -230,18 +243,20 @@ fn main() -> ! {
         .and_then(|n| n.parse::<usize>().ok())
         .and_then(NonZeroUsize::new);
 
-    sort(&inputs[..], sort_order, batch_size, buffer_size);
+    let payload = Payload {
+        inputs,
+        sort_order,
+        batch_size,
+        buffer_size,
+    };
+
+    sort(payload);
     exit(0)
 }
 
 /// `sort` handler
-fn sort(
-    input_args: &[InputArg<&str>],
-    _sort_order: SortOrder,
-    batch_size: Option<NonZeroUsize>,
-    buffer_size: Option<NonZeroUsize>,
-) {
-    let mut line_iter = input_args
+fn sort(payload: Payload) {
+    let mut line_iter = payload.inputs
         .iter()
         .flat_map(|input_arg| {
             Input::try_from(input_arg)
@@ -254,8 +269,8 @@ fn sort(
         .flat_map(|line| line.ok())
         .map(|line| line.into_boxed_slice()); // save bytes by dropping cap field
 
-    let batch_size = batch_size.map(|b| b.get()).unwrap_or(usize::max_value());
-    let buffer_size = buffer_size.map(|b| b.get()).unwrap_or(usize::max_value());
+    let batch_size = payload.batch_size.map(|b| b.get()).unwrap_or(usize::max_value());
+    let buffer_size = payload.buffer_size.map(|b| b.get()).unwrap_or(usize::max_value());
     eprintln!(
         "batch_size {}k, buffer_size {}M",
         batch_size >> 10,
