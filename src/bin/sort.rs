@@ -3,22 +3,25 @@
 //! With no FILE, or when FILE is -, read standard input.
 //!
 //! Todo:
+//!  - perform N-way merge when flushing to file
+//!  - flushing should not be done on main thread
 //!  - more sort ordering
 //!  - reverse
 //!  - unique
-//!  - parallel
 
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::process::exit;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use std::io::Split;
 use std::vec::IntoIter;
 
+use coreutils::executor::{Job, ThreadPool};
 use coreutils::io::{Input, InputArg};
 
 use clap::{App, Arg};
@@ -39,6 +42,8 @@ struct Payload<'a> {
     batch_size: Option<NonZeroUsize>,
     /// main memory buffer size
     buffer_size: Option<NonZeroUsize>,
+    /// number of sorts run concurrently
+    sort_threads: NonZeroU32,
 }
 
 #[allow(dead_code)]
@@ -176,6 +181,22 @@ impl PartialOrd for SortedChunk {
     }
 }
 
+struct SortJob(Vec<Line>, Arc<Mutex<Vec<SortedChunk>>>, Instant);
+
+impl Job for SortJob {
+    fn run(self) {
+        let SortJob(mut lines, chunks, now) = self;
+        lines.sort_unstable();
+        eprintln!(
+            "{:>5} - sorted",
+            Instant::now().duration_since(now).as_millis()
+        );
+
+        let chunk = SortedChunk::new(lines);
+        chunks.lock().unwrap().push(chunk);
+    }
+}
+
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
     let matches = App::new("sort")
@@ -199,6 +220,13 @@ fn main() -> ! {
                 .value_name("SIZE")
                 .short("S")
                 .help("use SIZE for main memory buffer")
+                .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("parallel")
+                .long("parallel")
+                .value_name("N")
+                .help("change the number of sorts run concurrently to N")
                 .takes_value(true),
         )
         .arg(
@@ -243,11 +271,18 @@ fn main() -> ! {
         .and_then(|n| n.parse::<usize>().ok())
         .and_then(NonZeroUsize::new);
 
+    let sort_threads = matches
+        .value_of("parallel")
+        .and_then(|n| n.parse::<u32>().ok())
+        .and_then(NonZeroU32::new)
+        .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+
     let payload = Payload {
         inputs,
         sort_order,
         batch_size,
         buffer_size,
+        sort_threads,
     };
 
     sort(payload);
@@ -256,7 +291,8 @@ fn main() -> ! {
 
 /// `sort` handler
 fn sort(payload: Payload) {
-    let mut line_iter = payload.inputs
+    let mut line_iter = payload
+        .inputs
         .iter()
         .flat_map(|input_arg| {
             Input::try_from(input_arg)
@@ -269,17 +305,25 @@ fn sort(payload: Payload) {
         .flat_map(|line| line.ok())
         .map(|line| line.into_boxed_slice()); // save bytes by dropping cap field
 
-    let batch_size = payload.batch_size.map(|b| b.get()).unwrap_or(usize::max_value());
-    let buffer_size = payload.buffer_size.map(|b| b.get()).unwrap_or(usize::max_value());
+    let batch_size = payload
+        .batch_size
+        .map(|b| b.get())
+        .unwrap_or(usize::max_value());
+    let buffer_size = payload
+        .buffer_size
+        .map(|b| b.get())
+        .unwrap_or(usize::max_value());
     eprintln!(
         "batch_size {}k, buffer_size {}M",
         batch_size >> 10,
         buffer_size >> 20
     );
 
+    let mut executor = ThreadPool::new(payload.sort_threads);
+
     let mut exhausted = false;
     let mut bytes = 0;
-    let mut chunks = vec![];
+    let chunks = Arc::new(Mutex::new(vec![]));
     let now = Instant::now();
 
     while !exhausted {
@@ -302,16 +346,12 @@ fn sort(payload: Payload) {
             count
         );
 
-        lines.sort_unstable();
-        eprintln!(
-            "{:>5} - sorted",
-            Instant::now().duration_since(now).as_millis()
-        );
-
-        let chunk = SortedChunk::new(lines);
+        executor.submit(SortJob(lines, chunks.clone(), now));
 
         if !exhausted && bytes > buffer_size {
             chunks
+                .lock()
+                .unwrap()
                 .iter_mut()
                 .for_each(|c: &mut SortedChunk| c.flush_to_disk());
             eprintln!(
@@ -320,14 +360,13 @@ fn sort(payload: Payload) {
             );
             bytes = 0;
         }
-
-        chunks.push(chunk);
     }
+
+    executor.finish();
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-
-    let mut chunks: BinaryHeap<_> = chunks.into_iter().collect();
+    let mut chunks: BinaryHeap<_> = chunks.lock().unwrap().drain(..).collect();
 
     while let Some(mut chunk) = chunks.pop() {
         let exhausted = match chunks.peek().and_then(|c| c.peek()) {
