@@ -40,7 +40,7 @@ struct Payload<'a> {
     /// sort order
     sort_order: SortOrder,
     /// merge at most N inputs at once
-    batch_size: Option<NonZeroUsize>,
+    batch_size: NonZeroUsize,
     /// main memory buffer size
     buffer_size: Option<NonZeroUsize>,
     /// number of sorts run concurrently
@@ -334,7 +334,8 @@ fn main() -> ! {
     let batch_size = matches
         .value_of("batch-size")
         .and_then(|n| n.parse::<usize>().ok())
-        .and_then(NonZeroUsize::new);
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| NonZeroUsize::new(100_000).unwrap());
 
     let buffer_size = matches
         .value_of("buffer-size")
@@ -345,7 +346,7 @@ fn main() -> ! {
         .value_of("parallel")
         .and_then(|n| n.parse::<u32>().ok())
         .and_then(NonZeroU32::new)
-        .unwrap_or_else(|| NonZeroU32::new(1).unwrap());
+        .unwrap_or_else(|| NonZeroU32::new(num_cpus::get() as u32).unwrap());
 
     let payload = Payload {
         inputs,
@@ -375,10 +376,7 @@ fn sort(payload: Payload) {
         .flat_map(|line| line.ok())
         .map(|line| line.into_boxed_slice()); // save bytes by dropping cap field
 
-    let batch_size = payload
-        .batch_size
-        .map(|b| b.get())
-        .unwrap_or(usize::max_value());
+    let batch_size = payload.batch_size.get();
     let buffer_size = payload
         .buffer_size
         .map(|b| b.get())
