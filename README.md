@@ -8,7 +8,7 @@ Linux (core) utilities rewritten in Rust, for fun and profit
 | less   | show file<br>cursor navigation<br>search and highlight | show stdin<br>searching backwards<br>terminal resizing<br>page up/down<br>tailing<br>... | termion<br>regex<br>memmap  |
 | ping   | ipv4<br>ipv6 (somewhat)<br>resolving                   | ipv6 sequence numbers<br>icmp identifiers<br>report ttl, damaged<br>...                  | pnet                        |
 | pv     | stats<br>progress bar<br>                              | ...                                                                                      | indicatif                   |
-| sort   | byte order<br>in-mem<br>external (batch)               | other ordering<br>parallel<br>other options                                              | tempfile                    |
+| sort   | byte order<br>in-mem<br>external (batch)<br>parallel   | other ordering<br>other options                                                          | tempfile                    |
 | sponge | spong to file<br>sponge to stdout<br>append            | use tempfiles<br>atomic file mv                                                          |                             |
 | tail   | tail file<br>tail stdin<br>follow -f<br>lines -n       | tail multiple files<br>...                                                               | clap                        |
 | tee    | tee to file(s)<br>append                               | ignore SIGINT option                                                                     |                             |

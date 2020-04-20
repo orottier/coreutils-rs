@@ -3,8 +3,7 @@
 //! With no FILE, or when FILE is -, read standard input.
 //!
 //! Todo:
-//!  - perform N-way merge when flushing to file
-//!  - flushing should not be done on main thread
+//!  - code cleanup
 //!  - more sort ordering
 //!  - reverse
 //!  - unique
@@ -14,6 +13,7 @@ use std::convert::TryFrom;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::ops::DerefMut;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -28,6 +28,7 @@ use clap::{App, Arg};
 use tempfile::tempfile;
 
 const USAGE: &str = "Sort lines of text files";
+const N_WAY_MERGE: usize = 5;
 
 type Line = Box<[u8]>;
 
@@ -73,6 +74,7 @@ impl Iterator for LineIterator {
 
 #[derive(Debug)]
 struct SortedChunk {
+    merged: bool,
     source: LineIterator,
     head: Option<Line>,
 }
@@ -91,6 +93,7 @@ impl SortedChunk {
         let iter = lines.into_iter();
 
         let mut me = Self {
+            merged: false,
             source: LineIterator::Vec(iter),
             head: None,
         };
@@ -100,53 +103,36 @@ impl SortedChunk {
         me
     }
 
-    pub fn flush_to_disk(&mut self) {
-        // no-op if already file
+    pub fn is_flushed(&self) -> bool {
         if let LineIterator::File(_) = self.source {
-            return;
+            true
+        } else {
+            false
         }
-
-        let mut tempfile = tempfile().unwrap();
-        {
-            let mut write = BufWriter::new(&mut tempfile);
-            self.source
-                .try_for_each(|line| {
-                    write
-                        .write_all(&line)
-                        .and_then(|_| write.write_all(&[b'\n']))
-                })
-                .unwrap();
-        }
-        tempfile.seek(SeekFrom::Start(0)).unwrap();
-
-        let iter = BufReader::new(tempfile).split(b'\n');
-
-        *self = Self {
-            source: LineIterator::File(iter),
-            head: None,
-        };
-
-        self.next();
     }
 
-    fn peek(&self) -> Option<&Line> {
+    pub fn is_merged(&self) -> bool {
+        self.merged
+    }
+
+    pub fn peek(&self) -> Option<&Line> {
         self.head.as_ref()
     }
 
-    pub fn drain<W: Write>(&mut self, stdout: &mut W) {
+    pub fn drain<W: Write>(&mut self, write: &mut W) {
         self.for_each(|line| {
-            stdout
+            write
                 .write_all(&line)
-                .and_then(|_| stdout.write_all(&[b'\n']))
+                .and_then(|_| write.write_all(&[b'\n']))
                 .unwrap();
         });
     }
 
-    pub fn drain_until<W: Write>(&mut self, stdout: &mut W, limit: &Line) -> bool {
+    pub fn drain_until<W: Write>(&mut self, write: &mut W, limit: &Line) -> bool {
         while let Some(head) = self.next() {
-            stdout
+            write
                 .write_all(&head)
-                .and_then(|_| stdout.write_all(&[b'\n']))
+                .and_then(|_| write.write_all(&[b'\n']))
                 .unwrap();
 
             if self.peek().is_some() && self.peek().unwrap() > limit {
@@ -181,20 +167,104 @@ impl PartialOrd for SortedChunk {
     }
 }
 
-struct SortJob(Vec<Line>, Arc<Mutex<Vec<SortedChunk>>>, Instant);
+enum SortJob {
+    Sort(Vec<Line>, Arc<Mutex<Vec<SortedChunk>>>, Instant),
+    Merge(Vec<SortedChunk>, Arc<Mutex<Vec<SortedChunk>>>, Instant),
+    MergeFlush(Vec<SortedChunk>, Arc<Mutex<Vec<SortedChunk>>>, Instant),
+}
 
 impl Job for SortJob {
     fn run(self) {
-        let SortJob(mut lines, chunks, now) = self;
-        lines.sort_unstable();
-        eprintln!(
-            "{:>5} - sorted",
-            Instant::now().duration_since(now).as_millis()
-        );
-
-        let chunk = SortedChunk::new(lines);
-        chunks.lock().unwrap().push(chunk);
+        match self {
+            SortJob::Sort(lines, chunks, now) => run_sort(lines, chunks, now),
+            SortJob::Merge(merge, chunks, now) => run_merge(merge, chunks, now),
+            SortJob::MergeFlush(merge, chunks, now) => run_merge_flush(merge, chunks, now),
+        }
     }
+}
+
+fn run_sort(mut lines: Vec<Line>, chunks: Arc<Mutex<Vec<SortedChunk>>>, now: Instant) {
+    lines.sort_unstable();
+
+    let chunk = SortedChunk::new(lines);
+    chunks.lock().unwrap().push(chunk);
+
+    eprintln!(
+        "{:>5} threadpool - sorted",
+        Instant::now().duration_since(now).as_millis()
+    );
+}
+
+fn run_merge(merge: Vec<SortedChunk>, chunks: Arc<Mutex<Vec<SortedChunk>>>, now: Instant) {
+    let mut merge: BinaryHeap<_> = merge.into_iter().collect();
+    let mut merged = vec![];
+
+    while let Some(mut chunk) = merge.pop() {
+        match merge.peek().and_then(|c| c.peek()) {
+            Some(limit) => {
+                while let Some(head) = chunk.next() {
+                    merged.push(head);
+                    if chunk.peek().is_some() && chunk.peek().unwrap() > limit {
+                        break;
+                    }
+                }
+
+                if chunk.peek().is_some() {
+                    merge.push(chunk);
+                }
+            }
+            None => chunk.for_each(|l| merged.push(l)),
+        }
+    }
+
+    let mut chunk = SortedChunk::new(merged);
+    chunk.merged = true;
+
+    chunks.lock().unwrap().push(chunk);
+
+    eprintln!(
+        "{:>5} threadpool - merged",
+        Instant::now().duration_since(now).as_millis()
+    );
+}
+
+fn run_merge_flush(merge: Vec<SortedChunk>, chunks: Arc<Mutex<Vec<SortedChunk>>>, now: Instant) {
+    let mut merge: BinaryHeap<_> = merge.into_iter().collect();
+    let mut tempfile = tempfile().unwrap();
+
+    {
+        let mut write = BufWriter::new(&mut tempfile);
+
+        while let Some(mut chunk) = merge.pop() {
+            let exhausted = match merge.peek().and_then(|c| c.peek()) {
+                Some(limit) => chunk.drain_until(&mut write, limit),
+                None => {
+                    chunk.drain(&mut write);
+                    true
+                }
+            };
+            if !exhausted {
+                merge.push(chunk);
+            }
+        }
+    }
+
+    tempfile.seek(SeekFrom::Start(0)).unwrap();
+
+    let iter = BufReader::new(tempfile).split(b'\n');
+    let mut chunk = SortedChunk {
+        merged: true,
+        source: LineIterator::File(iter),
+        head: None,
+    };
+    chunk.next();
+
+    chunks.lock().unwrap().push(chunk);
+
+    eprintln!(
+        "{:>5} threadpool - merge_flushed",
+        Instant::now().duration_since(now).as_millis()
+    );
 }
 
 /// Parse arguments, run job, pass return code
@@ -323,49 +393,106 @@ fn sort(payload: Payload) {
 
     let mut exhausted = false;
     let mut bytes = 0;
+    let mut batches = 0;
     let chunks = Arc::new(Mutex::new(vec![]));
     let now = Instant::now();
 
     while !exhausted {
         let mut lines = vec![];
-        let mut count = 0;
+        let mut line_count = 0;
 
-        while count < batch_size {
+        while line_count < batch_size && bytes < buffer_size {
             if let Some(line) = line_iter.next() {
                 bytes += line.len();
+                line_count += 1;
                 lines.push(line);
             } else {
                 exhausted = true;
                 break;
             }
-            count += 1;
         }
+
         eprintln!(
-            "{:>5} - collected {} lines",
+            "{:>5} main - collected {} lines",
             Instant::now().duration_since(now).as_millis(),
-            count
+            line_count
         );
 
-        executor.submit(SortJob(lines, chunks.clone(), now));
+        executor.submit(SortJob::Sort(lines, chunks.clone(), now));
+        batches += 1;
 
-        if !exhausted && bytes > buffer_size {
-            chunks
-                .lock()
-                .unwrap()
-                .iter_mut()
-                .for_each(|c: &mut SortedChunk| c.flush_to_disk());
-            eprintln!(
-                "{:>5} - flushed all to disk",
-                Instant::now().duration_since(now).as_millis()
-            );
+        if !exhausted && (bytes > buffer_size || batches > N_WAY_MERGE) {
+            batches = 0;
+            let mut batch = vec![];
+            let jobs = {
+                let mut lock = chunks.lock().unwrap();
+                let all = std::mem::replace(lock.deref_mut(), vec![]);
+
+                let mut jobs = all
+                    .into_iter()
+                    .flat_map(|chunk| {
+                        if chunk.is_flushed() || chunk.is_merged() {
+                            lock.push(chunk);
+                        } else {
+                            batch.push(chunk);
+                            if batch.len() == N_WAY_MERGE {
+                                let payload = std::mem::replace(&mut batch, vec![]);
+                                if bytes > buffer_size {
+                                    return Some(SortJob::MergeFlush(payload, chunks.clone(), now));
+                                } else {
+                                    return Some(SortJob::Merge(payload, chunks.clone(), now));
+                                }
+                            }
+                        }
+
+                        None
+                    })
+                    .collect::<Vec<_>>();
+
+                if !batch.is_empty() {
+                    if bytes > buffer_size {
+                        jobs.push(SortJob::MergeFlush(batch, chunks.clone(), now));
+                    } else {
+                        jobs.push(SortJob::Merge(batch, chunks.clone(), now));
+                    }
+                }
+
+                jobs
+            }; // drop chunks write lock
+
+            // this could block if all workers are busy
+            jobs.into_iter().for_each(|job| {
+                eprintln!(
+                    "{:>5} main - {} request",
+                    Instant::now().duration_since(now).as_millis(),
+                    match job {
+                        SortJob::MergeFlush(..) => "merge_flush",
+                        SortJob::Merge(..) => "merge",
+                        _ => unreachable!(),
+                    }
+                );
+                executor.submit(job)
+            });
+
             bytes = 0;
         }
     }
 
+    eprintln!(
+        "{:>5} main - await thread pool",
+        Instant::now().duration_since(now).as_millis()
+    );
     executor.finish();
 
+    eprintln!(
+        "{:>5} main - done, merging {} chunks",
+        Instant::now().duration_since(now).as_millis(),
+        chunks.lock().unwrap().len()
+    );
+
     let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let stdout = stdout.lock();
+    let mut stdout = BufWriter::new(stdout);
     let mut chunks: BinaryHeap<_> = chunks.lock().unwrap().drain(..).collect();
 
     while let Some(mut chunk) = chunks.pop() {
@@ -382,7 +509,7 @@ fn sort(payload: Payload) {
     }
 
     eprintln!(
-        "{:>5} - done",
+        "{:>5} main - done",
         Instant::now().duration_since(now).as_millis()
     );
 }
