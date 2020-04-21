@@ -13,21 +13,22 @@
 //! the exit status is 128+9 rather than 124.
 //!
 //! Todo:
-//!  - clean up child process (remains running even after main finishes)
-//!  - send TERM signal instead of terminating thread
+//!  - send TERM signal instead of killing child directly
 //!  - support more signals
 //!  - send KILL if first signal has no effect
 //!  - other options
 
 use std::process::exit;
-use std::process::Command;
-use std::sync::{Arc, Condvar, Mutex};
+use std::process::{Child, Command};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "timeout [OPTION] DURATION COMMAND [ARG]...";
+
+/// Check the child process using this interval
+const SLEEP_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
@@ -61,48 +62,37 @@ fn timeout(duration: Duration, command: &str, args: &[String]) -> i32 {
         cmd.arg(arg);
     });
 
-    #[allow(clippy::mutex_atomic)] // we need it for the CondVar
-    let pair = Arc::new((Mutex::new(true), Condvar::new()));
-    let pair2 = pair.clone();
+    let start = Instant::now();
 
-    let handle = thread::spawn(move || {
-        let status_code = if let Ok(mut child) = cmd.spawn() {
-            // todo, `wait()` closes stdin, is this desired?
-            if let Ok(result) = child.wait() {
-                result.code().unwrap_or(-1)
-            } else {
-                eprintln!("unable to await child process");
-                -1
-            }
-        } else {
+    let mut child: Child = match cmd.spawn() {
+        Err(_) => {
             eprintln!("unable to spawn command");
-            -1
-        };
+            return -1;
+        }
+        Ok(child) => child,
+    };
 
-        let (lock, cvar) = &*pair2;
-        let mut pending = lock.lock().unwrap();
-        *pending = false;
-
-        // notify the condvar that the we are finished
-        cvar.notify_one();
-
-        status_code
-    });
-
-    let (lock, cvar) = &*pair;
-    let result = cvar
-        .wait_timeout_while(lock.lock().unwrap(), duration, |&mut pending| pending)
-        .unwrap();
-
-    if result.1.timed_out() {
-        124
-    } else {
-        match handle.join() {
-            Ok(status_code) => status_code,
-            Err(_) => {
-                eprintln!("unable to join thread");
-                -1
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(result)) => break Ok(result.code().unwrap_or(-1)),
+            Ok(None) => {
+                if start.elapsed() > duration {
+                    break Err(child);
+                }
+                thread::sleep(SLEEP_INTERVAL);
             }
+            Err(_) => {
+                eprintln!("unable to await child process");
+                break Err(child);
+            }
+        }
+    };
+
+    match result {
+        Ok(status_code) => status_code,
+        Err(mut child) => {
+            child.kill().expect("Unable to kill child process");
+            124
         }
     }
 }

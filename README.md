@@ -12,7 +12,7 @@ Linux (core) utilities rewritten in Rust, for fun and profit
 | sponge  | spong to file<br>sponge to stdout<br>append            | use tempfiles<br>atomic file mv                                                          |                              |
 | tail    | tail file<br>tail stdin<br>follow -f<br>lines -n       | tail multiple files<br>...                                                               | clap                         |
 | tee     | tee to file(s)<br>append                               | ignore SIGINT option                                                                     |                              |
-| timeout | run cmd with time limit                                | send signals<br>clean child process                                                      |                              |
+| timeout | run cmd with time limit                                | send signals                                                                             |                              |
 | xargs   | batch<br>single<br>parallel<br>max args<br>verbose     | less unwraps()<br>more options                                                           | clap                         |
 
 # Build instructions
