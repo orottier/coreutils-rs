@@ -9,14 +9,58 @@
 //!  - support options
 
 use std::convert::TryFrom;
-use std::io::{self, BufRead, Write};
+use std::num::NonZeroU32;
 use std::process::exit;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use coreutils::io::{Input, InputArg};
 use coreutils::chunks::ChunkedReader;
+use coreutils::executor::{Job, ThreadPool};
+use coreutils::io::{Input, InputArg};
 use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "cat [OPTION]... [FILE]... : concatenate FILE(s) to standard output";
+
+struct WcJob(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Vec<u8>);
+
+impl Job for WcJob {
+    fn run(self) {
+        let WcJob(chars_total, words_total, lines_total, chunk) = self;
+
+        let mut n_chars = 0u64;
+        let mut n_words = 0u64;
+        let mut n_lines = 0u64;
+        let mut prev_was_whitespace = true;
+
+        std::str::from_utf8(&chunk).unwrap().chars().for_each(|c| {
+            n_chars += 1;
+            if c.is_whitespace() {
+                if !prev_was_whitespace {
+                    n_words += 1;
+                    prev_was_whitespace = true;
+                }
+
+                if c == '\n' {
+                    n_lines += 1;
+                }
+            } else {
+                prev_was_whitespace = false;
+            }
+        });
+
+        // count the newline at the end of this chunk
+        n_chars += 1;
+        n_lines += 1;
+
+        if !prev_was_whitespace {
+            n_words += 1;
+        }
+
+        chars_total.fetch_add(n_chars, Ordering::Relaxed);
+        words_total.fetch_add(n_words, Ordering::Relaxed);
+        lines_total.fetch_add(n_lines, Ordering::Relaxed);
+    }
+}
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
@@ -78,8 +122,14 @@ fn main() -> ! {
 }
 
 /// `cat` implementation
-fn wc(input_args: &[InputArg<String>], bytes: bool, chars: bool, words: bool, lines: bool, max_line_length: bool) {
-
+fn wc(
+    input_args: &[InputArg<String>],
+    _bytes: bool,
+    _chars: bool,
+    _words: bool,
+    _lines: bool,
+    _max_line_length: bool,
+) {
     let inputs = input_args
         .iter()
         .flat_map(|input_arg| {
@@ -92,37 +142,27 @@ fn wc(input_args: &[InputArg<String>], bytes: bool, chars: bool, words: bool, li
         .map(|input| input.into_read())
         .collect();
 
-    let mut n_chars = 0u64;
-    let mut n_words = 0u64;
-    let mut n_lines = 0u64;
-    let mut prev_was_whitespace = true;
+    let mut executor = ThreadPool::new(NonZeroU32::new(num_cpus::get() as u32).unwrap());
 
-    let mut reader = ChunkedReader::new(inputs, b'\n', 1 << 25);
+    let chars_total = Arc::new(AtomicU64::new(0));
+    let words_total = Arc::new(AtomicU64::new(0));
+    let lines_total = Arc::new(AtomicU64::new(0));
+
+    let reader = ChunkedReader::new(inputs, b'\n', 1 << 25);
     reader.for_each(|chunk| {
-        std::str::from_utf8(&chunk.unwrap()).unwrap().chars().for_each(|c| {
-            n_chars += 1;
-            if c.is_whitespace() {
-                if !prev_was_whitespace {
-                    n_words += 1;
-                    prev_was_whitespace = true;
-                }
-
-                if c == '\n' {
-                    n_lines += 1;
-                }
-            } else {
-                prev_was_whitespace = false;
-            }
-        });
-
-        // count the newline at the end of this chunk
-        n_chars += 1;
-        n_lines += 1;
-
-        if !prev_was_whitespace {
-            n_words += 1;
-        }
+        let c = chars_total.clone();
+        let w = words_total.clone();
+        let l = lines_total.clone();
+        let job = WcJob(c, w, l, chunk.unwrap());
+        executor.submit(job);
     });
 
-    println!("{} {} {}", n_chars, n_words, n_lines);
+    executor.finish();
+
+    println!(
+        "{} {} {}",
+        chars_total.load(Ordering::Relaxed),
+        words_total.load(Ordering::Relaxed),
+        lines_total.load(Ordering::Relaxed)
+    );
 }

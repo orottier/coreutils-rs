@@ -3,7 +3,7 @@
 use std::convert::TryFrom;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 pub enum InputArg<S: AsRef<Path>> {
@@ -30,6 +30,13 @@ impl<S: AsRef<Path>> TryFrom<&InputArg<S>> for Input {
 }
 
 impl Input {
+    pub fn into_read(self) -> Box<dyn Read> {
+        match self {
+            Input::Stdin(stdin) => Box::new(stdin) as Box<dyn Read>,
+            Input::File(file) => Box::new(file) as Box<dyn Read>,
+        }
+    }
+
     pub fn as_bufread(&self) -> impl BufRead + '_ {
         match &self {
             Input::Stdin(stdin) => Box::new(stdin.lock()) as Box<dyn BufRead>,
