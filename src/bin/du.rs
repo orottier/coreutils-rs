@@ -8,13 +8,33 @@
 //! - apparent or actual block size?
 //! - implement all options
 
-use std::os::macos::fs::MetadataExt;
+use std::fs::Metadata;
 use std::path::PathBuf;
 use std::process::exit;
 
 use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "du [OPTION]... [FILE]...: estimate file space usage";
+
+#[cfg(target_os = "linux")]
+#[inline(always)]
+pub fn file_size(attr: &Metadata) -> u64 {
+    use std::os::linux::fs::MetadataExt;
+    attr.st_blocks()
+}
+
+#[cfg(target_os = "macos")]
+#[inline(always)]
+pub fn file_size(attr: &Metadata) -> u64 {
+    use std::os::macos::fs::MetadataExt;
+    attr.st_blocks()
+}
+
+#[cfg(target_os = "windows")]
+#[inline(always)]
+pub fn file_size(attr: &Metadata) -> u64 {
+    attr.len()
+}
 
 /// Parse arguments, run job, pass return code
 fn main() -> ! {
@@ -90,7 +110,7 @@ impl DuTask {
                             };
                             next_holder = Some(Box::new(task));
                         } else {
-                            size += attr.st_blocks();
+                            size += file_size(&attr);
                         }
                     } else {
                         eprintln!("{:?}", entry_result.unwrap_err());
