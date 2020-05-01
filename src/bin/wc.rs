@@ -1,64 +1,214 @@
 //! `wc`: print newline, word, and byte counts for each file
 //!
-//! Print  newline, word, and byte counts for each FILE, and a total line if more than one FILE is
+//! Print newline, word, and byte counts for each FILE, and a total line if more than one FILE is
 //! specified.  A word is a non-zero-length sequence of characters delimited by white space.
 //!
 //! With no FILE, or when FILE is -, read standard input.
 //!
+//! This executable counts chunks of bytes in parallel, taking care of proper multibyte char
+//! boundaries. Special care is taken to not exhaust memory when processing huge single-line files.
+//!
 //! Todo:
-//!  - support options
+//!  - print info for each input, not just grand total
 
 use std::convert::TryFrom;
+use std::io::{BufReader, Read};
 use std::num::NonZeroU32;
 use std::process::exit;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use coreutils::chunks::ChunkedReader;
+use coreutils::chunks::{ChunkedItem, ChunkedReader};
 use coreutils::executor::{Job, ThreadPool};
 use coreutils::io::{Input, InputArg};
 use coreutils::util::print_help_and_exit;
 
 const USAGE: &str = "cat [OPTION]... [FILE]... : concatenate FILE(s) to standard output";
 
-struct WcJob(Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Vec<u8>);
+/// Process chunks of 1MB each
+const CHUNK_SIZE: usize = 1 << 20;
 
-impl Job for WcJob {
-    fn run(self) {
-        let WcJob(chars_total, words_total, lines_total, chunk) = self;
+// https://tools.ietf.org/html/rfc3629
+static UTF8_CHAR_WIDTH: [u8; 256] = [
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, // 0x1F
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, // 0x3F
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, // 0x5F
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, // 0x7F
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, // 0x9F
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, // 0xBF
+    0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, // 0xDF
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // 0xEF
+    4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0xFF
+];
 
-        let mut n_chars = 0u64;
-        let mut n_words = 0u64;
-        let mut n_lines = 0u64;
-        let mut prev_was_whitespace = true;
+/// Stream bytes into chars
+struct BytesToChars<I: Iterator<Item = u8>> {
+    bytes: I,
+}
 
-        std::str::from_utf8(&chunk).unwrap().chars().for_each(|c| {
-            n_chars += 1;
-            if c.is_whitespace() {
-                if !prev_was_whitespace {
-                    n_words += 1;
-                    prev_was_whitespace = true;
-                }
+/// Unicode point, could be invalid
+struct UncheckedChar([u8; 4], usize);
 
-                if c == '\n' {
-                    n_lines += 1;
-                }
-            } else {
-                prev_was_whitespace = false;
-            }
-        });
+impl<I: Iterator<Item = u8>> Iterator for BytesToChars<I> {
+    type Item = UncheckedChar;
 
-        // count the newline at the end of this chunk
-        n_chars += 1;
-        n_lines += 1;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [0u8; 4];
 
-        if !prev_was_whitespace {
-            n_words += 1;
+        buf[0] = match self.bytes.next() {
+            None => return None,
+            Some(b) => b,
+        };
+
+        let len = UTF8_CHAR_WIDTH[buf[0] as usize] as usize;
+        if len == 0 {
+            panic!("invalid unicode");
         }
 
-        chars_total.fetch_add(n_chars, Ordering::Relaxed);
-        words_total.fetch_add(n_words, Ordering::Relaxed);
-        lines_total.fetch_add(n_lines, Ordering::Relaxed);
+        for b in buf.iter_mut().take(len).skip(1) {
+            *b = self.bytes.next().expect("incomplete unicode char");
+        }
+
+        Some(UncheckedChar(buf, len))
+    }
+}
+
+/// Count bytes and newlines
+fn count_bytes<I: Iterator<Item = u8>>(input: I) -> (u64, u64) {
+    let mut bytes = 0;
+    let mut lines = 0;
+
+    for b in input {
+        bytes += 1;
+        if b == b'\n' {
+            lines += 1;
+        }
+    }
+
+    // count the newline at the end of this chunk
+    bytes += 1;
+    lines += 1;
+
+    (bytes, lines)
+}
+
+/// Count all `wc` quantities
+fn count_all<I: Iterator<Item = UncheckedChar>>(input: I) -> (u64, u64, u64, u64, u64) {
+    let mut bytes = 0;
+    let mut chars = 0;
+    let mut lines = 0;
+    let mut words = 0;
+    let mut max_line_length = 0;
+
+    let mut line_length = 0;
+    let mut prev_was_whitespace = true;
+    let mut prev_was_newline = false;
+
+    for UncheckedChar(buf, len) in input {
+        bytes += len as u64;
+        chars += 1;
+
+        // only consider ASCII whitespace for now
+        if len == 1 && buf[0] >= 9 && buf[0] <= 14 {
+            if !prev_was_whitespace {
+                words += 1;
+                prev_was_whitespace = true;
+            }
+
+            if buf[0] == 10 {
+                if line_length > max_line_length {
+                    max_line_length = line_length;
+                }
+
+                lines += 1;
+                line_length = 0;
+                prev_was_newline = true;
+            } else {
+                line_length += 1;
+                prev_was_newline = false;
+            }
+        } else {
+            prev_was_whitespace = false;
+            prev_was_newline = false;
+            line_length += 1;
+        }
+    }
+
+    if !prev_was_newline {
+        chars += 1;
+        bytes += 1;
+        lines += 1;
+    }
+
+    if !prev_was_whitespace {
+        words += 1;
+    }
+
+    (bytes, chars, words, lines, max_line_length)
+}
+
+struct WcBytesJob {
+    chunk: ChunkedItem<Box<dyn Read + Send>>,
+
+    bytes: Arc<AtomicU64>,
+    lines: Arc<AtomicU64>,
+}
+
+impl Job for WcBytesJob {
+    fn run(self) {
+        let (b, l) = match self.chunk {
+            ChunkedItem::Chunk(data) => count_bytes(data.into_iter()),
+            ChunkedItem::Bail(data, read) => {
+                let bytes_left = BufReader::new(read).bytes().map(|b| b.unwrap());
+                let bytes = data.into_iter().chain(bytes_left);
+                count_bytes(bytes)
+            }
+        };
+
+        self.bytes.fetch_add(b, Ordering::Relaxed);
+        self.lines.fetch_add(l, Ordering::Relaxed);
+    }
+}
+
+struct WcAllJob {
+    chunk: ChunkedItem<Box<dyn Read + Send>>,
+
+    bytes: Arc<AtomicU64>,
+    chars: Arc<AtomicU64>,
+    words: Arc<AtomicU64>,
+    lines: Arc<AtomicU64>,
+    max_line_length: Arc<AtomicU64>,
+}
+
+impl Job for WcAllJob {
+    fn run(self) {
+        let (b, c, w, l, ll) = match self.chunk {
+            ChunkedItem::Chunk(data) => {
+                let chars = BytesToChars {
+                    bytes: data.into_iter(),
+                };
+                count_all(chars)
+            }
+            ChunkedItem::Bail(data, read) => {
+                let bytes_left = BufReader::new(read).bytes().map(|b| b.unwrap());
+                let bytes = data.into_iter().chain(bytes_left);
+                let chars = BytesToChars { bytes };
+                count_all(chars)
+            }
+        };
+
+        self.bytes.fetch_add(b, Ordering::Relaxed);
+        self.chars.fetch_add(c, Ordering::Relaxed);
+        self.words.fetch_add(w, Ordering::Relaxed);
+        self.lines.fetch_add(l, Ordering::Relaxed);
+        self.max_line_length.fetch_add(ll, Ordering::Relaxed);
     }
 }
 
@@ -117,52 +267,109 @@ fn main() -> ! {
         lines = true;
     }
 
-    wc(&inputs, bytes, chars, words, lines, max_line_length);
+    if chars || words || max_line_length {
+        wc_all(&inputs, bytes, chars, words, lines, max_line_length);
+    } else {
+        wc_bytes(&inputs, bytes, lines);
+    }
+
     exit(0)
 }
 
-/// `cat` implementation
-fn wc(
-    input_args: &[InputArg<String>],
-    _bytes: bool,
-    _chars: bool,
-    _words: bool,
-    _lines: bool,
-    _max_line_length: bool,
-) {
-    let inputs = input_args
-        .iter()
-        .flat_map(|input_arg| {
-            Input::try_from(input_arg)
-                .map_err(|_| {
-                    eprintln!("...");
-                })
-                .ok()
-        })
-        .map(|input| input.into_read())
-        .collect();
+/// `wc` implementation, counting only bytes and/or lines
+fn wc_bytes(input_args: &[InputArg<String>], show_bytes: bool, show_lines: bool) {
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let lines_total = Arc::new(AtomicU64::new(0));
 
     let mut executor = ThreadPool::new(NonZeroU32::new(num_cpus::get() as u32).unwrap());
 
-    let chars_total = Arc::new(AtomicU64::new(0));
-    let words_total = Arc::new(AtomicU64::new(0));
-    let lines_total = Arc::new(AtomicU64::new(0));
-
-    let reader = ChunkedReader::new(inputs, b'\n', 1 << 25);
-    reader.for_each(|chunk| {
-        let c = chars_total.clone();
-        let w = words_total.clone();
-        let l = lines_total.clone();
-        let job = WcJob(c, w, l, chunk.unwrap());
-        executor.submit(job);
-    });
+    input_args
+        .iter()
+        .flat_map(|input_arg| {
+            Input::try_from(input_arg)
+                .map_err(|_| eprintln!("Unable to read {:?}", input_arg))
+                .ok()
+        })
+        .map(|input| input.into_read())
+        .for_each(|read| {
+            let reader = ChunkedReader::new(read, b'\n', CHUNK_SIZE);
+            reader.for_each(|chunk| {
+                let job = WcBytesJob {
+                    chunk: chunk.unwrap(),
+                    bytes: bytes_total.clone(),
+                    lines: lines_total.clone(),
+                };
+                executor.submit(job);
+            });
+        });
 
     executor.finish();
 
-    println!(
-        "{} {} {}",
-        chars_total.load(Ordering::Relaxed),
-        words_total.load(Ordering::Relaxed),
-        lines_total.load(Ordering::Relaxed)
-    );
+    if show_lines {
+        print!("l:{} ", lines_total.load(Ordering::Relaxed));
+    }
+    if show_bytes {
+        print!("b:{} ", bytes_total.load(Ordering::Relaxed));
+    }
+    println!()
+}
+
+/// `wc` implementation, counting all quantities
+fn wc_all(
+    input_args: &[InputArg<String>],
+    show_bytes: bool,
+    show_chars: bool,
+    show_words: bool,
+    show_lines: bool,
+    show_max_line_length: bool,
+) {
+    let bytes_total = Arc::new(AtomicU64::new(0));
+    let chars_total = Arc::new(AtomicU64::new(0));
+    let words_total = Arc::new(AtomicU64::new(0));
+    let lines_total = Arc::new(AtomicU64::new(0));
+    let max_line_length = Arc::new(AtomicU64::new(0));
+
+    let mut executor = ThreadPool::new(NonZeroU32::new(num_cpus::get() as u32).unwrap());
+
+    input_args
+        .iter()
+        .flat_map(|input_arg| {
+            Input::try_from(input_arg)
+                .map_err(|_| eprintln!("Unable to read {:?}", input_arg))
+                .ok()
+        })
+        .map(|input| input.into_read())
+        .for_each(|read| {
+            let reader = ChunkedReader::new(read, b'\n', CHUNK_SIZE);
+            reader.for_each(|chunk| {
+                let job = WcAllJob {
+                    chunk: chunk.unwrap(),
+                    bytes: bytes_total.clone(),
+                    chars: chars_total.clone(),
+                    words: words_total.clone(),
+                    lines: lines_total.clone(),
+                    max_line_length: max_line_length.clone(),
+                };
+                executor.submit(job);
+            });
+        });
+
+    executor.finish();
+
+    if show_lines {
+        print!("l:{} ", lines_total.load(Ordering::Relaxed));
+    }
+    if show_words {
+        print!("w:{} ", words_total.load(Ordering::Relaxed));
+    }
+    if show_chars {
+        print!("c:{} ", chars_total.load(Ordering::Relaxed));
+    }
+    if show_bytes {
+        print!("b:{} ", bytes_total.load(Ordering::Relaxed));
+    }
+    if show_max_line_length {
+        print!("b:{} ", max_line_length.load(Ordering::Relaxed));
+    }
+    println!()
 }

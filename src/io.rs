@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 
+#[derive(Debug)]
 pub enum InputArg<S: AsRef<Path>> {
     /// Standard input
     Stdin,
@@ -30,10 +31,10 @@ impl<S: AsRef<Path>> TryFrom<&InputArg<S>> for Input {
 }
 
 impl Input {
-    pub fn into_read(self) -> Box<dyn Read> {
+    pub fn into_read(self) -> Box<dyn Read + Send> {
         match self {
-            Input::Stdin(stdin) => Box::new(stdin) as Box<dyn Read>,
-            Input::File(file) => Box::new(file) as Box<dyn Read>,
+            Input::Stdin(stdin) => Box::new(stdin),
+            Input::File(file) => Box::new(file),
         }
     }
 
