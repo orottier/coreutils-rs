@@ -15,6 +15,7 @@ Linux (core) utilities rewritten in Rust, for fun and profit
 | tail    | tail file<br>tail stdin<br>follow -f<br>lines -n       | tail multiple files<br>...                                                               | clap                         |
 | tee     | tee to file(s)<br>append                               | ignore SIGINT option                                                                     |                              |
 | timeout | run cmd with time limit                                | send signals                                                                             |                              |
+| wc      | parallel<br>fast path for line count                   | print summary per input<br>fast path for byte count                                      |                              |
 | xargs   | batch<br>single<br>parallel<br>max args<br>verbose     | less unwraps()<br>more options                                                           | clap                         |
 
 # Build instructions
